@@ -9,6 +9,7 @@ import httpx
 import yaml
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 import database
 
@@ -145,6 +146,11 @@ app = FastAPI(
     description="Rate Limiting and Observability Reverse Proxy for NVIDIA NIM APIs",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(ClientDisconnect)
+async def client_disconnect_handler(request: Request, exc: ClientDisconnect):
+    return Response(status_code=499)
 
 
 # --- Public Operational Endpoints ---
@@ -587,11 +593,18 @@ async def proxy_request(path: str, request: Request):
     db_path = config_data["db"]["path"]
 
     # 1. Rate Limiting Wait
-    await token_bucket.acquire()
+    try:
+        await token_bucket.acquire()
+    except (ClientDisconnect, asyncio.CancelledError):
+        return Response(status_code=499)
 
     # 2. Concurrency Control & Proxying
     async with concurrency_semaphore:
-        body = await request.body()
+        try:
+            body = await request.body()
+        except (ClientDisconnect, asyncio.CancelledError):
+            return Response(status_code=499)
+
         headers = dict(request.headers)
 
         # Never forward client's Authorization header
@@ -632,6 +645,8 @@ async def proxy_request(path: str, request: Request):
                     async for chunk in upstream_response.aiter_bytes():
                         bytes_count += len(chunk)
                         yield chunk
+                except (ClientDisconnect, asyncio.CancelledError):
+                    pass
                 finally:
                     await upstream_response.aclose()
                     latency_ms = (time.time() - start_time) * 1000.0
@@ -655,6 +670,8 @@ async def proxy_request(path: str, request: Request):
                 media_type=upstream_response.headers.get("content-type"),
             )
 
+        except (ClientDisconnect, asyncio.CancelledError):
+            return Response(status_code=499)
         except Exception as e:
             latency_ms = (time.time() - start_time) * 1000.0
             asyncio.create_task(
