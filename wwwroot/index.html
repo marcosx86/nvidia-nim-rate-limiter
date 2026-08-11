@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NVIDIA NIM Proxy Admin Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0d1117;
+            --card-bg: #161b22;
+            --border: #30363d;
+            --text: #c9d1d9;
+            --text-muted: #8b949e;
+            --accent: #76b900; /* NVIDIA Green */
+            --accent-hover: #5c9300;
+            --danger: #f85149;
+            --warning: #d29922;
+            --blue: #58a6ff;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            padding: 24px;
+            line-height: 1.5;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-bottom: 20px;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 24px;
+        }
+        .header h1 {
+            font-size: 1.5rem;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .badge {
+            background-color: rgba(118, 185, 0, 0.15);
+            color: var(--accent);
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            border: 1px solid rgba(118, 185, 0, 0.4);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+        }
+        .card-title {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+        .card-value {
+            font-size: 1.8rem;
+            font-weight: 700;
+            color: #fff;
+        }
+        .card-sub {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+        .section {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 24px;
+        }
+        .section-title {
+            font-size: 1.1rem;
+            color: #fff;
+            margin-bottom: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+        th, td {
+            padding: 10px 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+        th {
+            color: var(--text-muted);
+            font-weight: 500;
+            background-color: rgba(255,255,255,0.02);
+        }
+        tr:hover {
+            background-color: rgba(255,255,255,0.02);
+        }
+        .status-tag {
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .status-2xx { background: rgba(46, 160, 67, 0.2); color: #3fb950; }
+        .status-4xx { background: rgba(210, 153, 34, 0.2); color: #d29922; }
+        .status-5xx { background: rgba(248, 81, 73, 0.2); color: #f85149; }
+        
+        .form-group {
+            margin-bottom: 14px;
+        }
+        .form-group label {
+            display: block;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 8px 12px;
+            background-color: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: #fff;
+            font-size: 0.9rem;
+        }
+        .btn {
+            background-color: var(--accent);
+            color: #000;
+            font-weight: 600;
+            border: none;
+            padding: 10px 18px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .btn:hover {
+            background-color: var(--accent-hover);
+        }
+        .flex-container {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 24px;
+        }
+        @media (max-width: 900px) {
+            .flex-container { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+            NVIDIA NIM Rate Limiter
+        </h1>
+        <span class="badge" id="statusBadge">Active</span>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <div class="card-title">Token Bucket Tokens</div>
+            <div class="card-value" id="valTokens">-</div>
+            <div class="card-sub" id="valCapacity">Capacity: -</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Total Requests</div>
+            <div class="card-value" id="valTotalReq">-</div>
+            <div class="card-sub" id="valRpmLastMin">RPM (Last Min): -</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Avg Latency</div>
+            <div class="card-value" id="valAvgLatency">- ms</div>
+            <div class="card-sub">Proxied Responses</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Active Concurrency</div>
+            <div class="card-value" id="valConcurrency">-</div>
+            <div class="card-sub" id="valMaxConcurrency">Max Allowed: -</div>
+        </div>
+    </div>
+
+    <div class="flex-container">
+        <div class="section">
+            <div class="section-title">
+                <span>Recent Request Logs</span>
+                <button class="btn" style="padding: 4px 10px; font-size: 0.8rem;" onclick="fetchMetricsAndLogs()">Refresh</button>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Method</th>
+                        <th>Path</th>
+                        <th>Status</th>
+                        <th>Latency</th>
+                    </tr>
+                </thead>
+                <tbody id="logsBody">
+                    <tr><td colspan="5">Loading request logs...</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section">
+            <div class="section-title">Rate Limit Config</div>
+            <form id="configForm" onsubmit="saveConfig(event)">
+                <div class="form-group">
+                    <label>Requests Per Minute (RPM)</label>
+                    <input type="number" step="0.1" id="cfgRpm" required>
+                </div>
+                <div class="form-group">
+                    <label>Window Seconds</label>
+                    <input type="number" step="0.1" id="cfgWindow" required>
+                </div>
+                <div class="form-group">
+                    <label>Burst Capacity</label>
+                    <input type="number" step="0.1" id="cfgBurst" required>
+                </div>
+                <div class="form-group">
+                    <label>Concurrency Limit</label>
+                    <input type="number" id="cfgConcurrency" required>
+                </div>
+                <div class="form-group">
+                    <label>Upstream URL</label>
+                    <input type="text" id="cfgUpstream" required>
+                </div>
+                <button type="submit" class="btn" style="width: 100%;">Save & Apply Settings</button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        async function loadConfigForm() {
+            try {
+                const configRes = await fetch('/admin/config');
+                const config = await configRes.json();
+
+                document.getElementById('cfgRpm').value = config.rate_limit?.requests_per_minute ?? 6;
+                document.getElementById('cfgWindow').value = config.rate_limit?.window_seconds ?? 60;
+                document.getElementById('cfgBurst').value = config.rate_limit?.burst_capacity ?? 6;
+                document.getElementById('cfgConcurrency').value = config.proxy?.concurrency_limit ?? 1;
+                document.getElementById('cfgUpstream').value = config.proxy?.upstream_url ?? '';
+                document.getElementById('valMaxConcurrency').innerText = 'Max Allowed: ' + (config.proxy?.concurrency_limit ?? '-');
+            } catch (err) {
+                console.error('Error loading config:', err);
+            }
+        }
+
+        async function fetchMetricsAndLogs() {
+            try {
+                const [metricsRes, logsRes] = await Promise.all([
+                    fetch('/admin/metrics'),
+                    fetch('/admin/logs?limit=10')
+                ]);
+                const metrics = await metricsRes.json();
+                const logsData = await logsRes.json();
+
+                document.getElementById('valTokens').innerText = metrics.current_tokens ?? '-';
+                document.getElementById('valCapacity').innerText = 'Capacity: ' + (metrics.capacity ?? '-');
+                document.getElementById('valTotalReq').innerText = metrics.total_requests ?? 0;
+                document.getElementById('valRpmLastMin').innerText = 'RPM (Last Min): ' + (metrics.rpm_last_minute ?? 0);
+                document.getElementById('valAvgLatency').innerText = metrics.avg_latency_ms ? Math.round(metrics.avg_latency_ms) + ' ms' : '0 ms';
+                document.getElementById('valConcurrency').innerText = metrics.active_concurrency ?? 0;
+
+                // Fill Logs
+                const tbody = document.getElementById('logsBody');
+                tbody.innerHTML = '';
+                if (!logsData.logs || logsData.logs.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5">No request logs recorded yet.</td></tr>';
+                } else {
+                    logsData.logs.forEach(log => {
+                        const tr = document.createElement('tr');
+                        const dateStr = new Date(log.timestamp * 1000).toLocaleTimeString();
+                        let statusClass = 'status-2xx';
+                        if (log.status_code >= 400 && log.status_code < 500) statusClass = 'status-4xx';
+                        if (log.status_code >= 500) statusClass = 'status-5xx';
+
+                        tr.innerHTML = `
+                            <td>${dateStr}</td>
+                            <td><strong>${log.method}</strong></td>
+                            <td>${log.path}</td>
+                            <td><span class="status-tag ${statusClass}">${log.status_code}</span></td>
+                            <td>${Math.round(log.latency_ms)} ms</td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                }
+            } catch (err) {
+                console.error('Error fetching metrics/logs:', err);
+            }
+        }
+
+        async function saveConfig(e) {
+            e.preventDefault();
+            const payload = {
+                rate_limit: {
+                    requests_per_minute: parseFloat(document.getElementById('cfgRpm').value),
+                    window_seconds: parseFloat(document.getElementById('cfgWindow').value),
+                    burst_capacity: parseFloat(document.getElementById('cfgBurst').value)
+                },
+                proxy: {
+                    concurrency_limit: parseInt(document.getElementById('cfgConcurrency').value, 10),
+                    upstream_url: document.getElementById('cfgUpstream').value
+                }
+            };
+            try {
+                const res = await fetch('/admin/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (res.ok) {
+                    alert('Configuration updated successfully!');
+                    await loadConfigForm();
+                    await fetchMetricsAndLogs();
+                } else {
+                    alert('Error updating configuration.');
+                }
+            } catch (err) {
+                console.error('Error saving config:', err);
+                alert('Failed to connect to server.');
+            }
+        }
+
+        // Initialize
+        loadConfigForm();
+        fetchMetricsAndLogs();
+        setInterval(fetchMetricsAndLogs, 5000);
+    </script>
+</body>
+</html>
