@@ -1,0 +1,23 @@
+services:
+  nvidia-nim-ratelimit:
+    build: .
+    container_name: nvidia-nim-ratelimit
+
+    environment:
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+
+    restart: unless-stopped
+
+    ports:
+      - 8199:8000
+
+    read_only: true
+
+    tmpfs:
+      - /tmp
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
