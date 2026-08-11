@@ -471,16 +471,30 @@ async def admin_dashboard():
     </div>
 
     <script>
-        async function fetchData() {
+        async function loadConfigForm() {
             try {
-                const [metricsRes, logsRes, configRes] = await Promise.all([
+                const configRes = await fetch('/admin/config');
+                const config = await configRes.json();
+
+                document.getElementById('cfgRpm').value = config.rate_limit?.requests_per_minute ?? 6;
+                document.getElementById('cfgWindow').value = config.rate_limit?.window_seconds ?? 60;
+                document.getElementById('cfgBurst').value = config.rate_limit?.burst_capacity ?? 6;
+                document.getElementById('cfgConcurrency').value = config.proxy?.concurrency_limit ?? 1;
+                document.getElementById('cfgUpstream').value = config.proxy?.upstream_url ?? '';
+                document.getElementById('valMaxConcurrency').innerText = 'Max Allowed: ' + (config.proxy?.concurrency_limit ?? '-');
+            } catch (err) {
+                console.error('Error loading config:', err);
+            }
+        }
+
+        async function fetchMetricsAndLogs() {
+            try {
+                const [metricsRes, logsRes] = await Promise.all([
                     fetch('/admin/metrics'),
-                    fetch('/admin/logs?limit=10'),
-                    fetch('/admin/config')
+                    fetch('/admin/logs?limit=10')
                 ]);
                 const metrics = await metricsRes.json();
                 const logsData = await logsRes.json();
-                const config = await configRes.json();
 
                 document.getElementById('valTokens').innerText = metrics.current_tokens ?? '-';
                 document.getElementById('valCapacity').innerText = 'Capacity: ' + (metrics.capacity ?? '-');
@@ -488,14 +502,6 @@ async def admin_dashboard():
                 document.getElementById('valRpmLastMin').innerText = 'RPM (Last Min): ' + (metrics.rpm_last_minute ?? 0);
                 document.getElementById('valAvgLatency').innerText = metrics.avg_latency_ms ? Math.round(metrics.avg_latency_ms) + ' ms' : '0 ms';
                 document.getElementById('valConcurrency').innerText = metrics.active_concurrency ?? 0;
-                document.getElementById('valMaxConcurrency').innerText = 'Max Allowed: ' + (config.proxy?.concurrency_limit ?? '-');
-
-                // Fill Config
-                document.getElementById('cfgRpm').value = config.rate_limit?.requests_per_minute ?? 6;
-                document.getElementById('cfgWindow').value = config.rate_limit?.window_seconds ?? 60;
-                document.getElementById('cfgBurst').value = config.rate_limit?.burst_capacity ?? 6;
-                document.getElementById('cfgConcurrency').value = config.proxy?.concurrency_limit ?? 1;
-                document.getElementById('cfgUpstream').value = config.proxy?.upstream_url ?? '';
 
                 // Fill Logs
                 const tbody = document.getElementById('logsBody');
@@ -521,7 +527,7 @@ async def admin_dashboard():
                     });
                 }
             } catch (err) {
-                console.error('Error fetching admin data:', err);
+                console.error('Error fetching metrics/logs:', err);
             }
         }
 
@@ -538,21 +544,29 @@ async def admin_dashboard():
                     upstream_url: document.getElementById('cfgUpstream').value
                 }
             };
-            const res = await fetch('/admin/config', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            if (res.ok) {
-                alert('Configuration updated successfully!');
-                fetchData();
-            } else {
-                alert('Error updating configuration.');
+            try {
+                const res = await fetch('/admin/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (res.ok) {
+                    alert('Configuration updated successfully!');
+                    await loadConfigForm();
+                    await fetchMetricsAndLogs();
+                } else {
+                    alert('Error updating configuration.');
+                }
+            } catch (err) {
+                console.error('Error saving config:', err);
+                alert('Failed to connect to server.');
             }
         }
 
-        fetchData();
-        setInterval(fetchData, 5000);
+        // Initialize
+        loadConfigForm();
+        fetchMetricsAndLogs();
+        setInterval(fetchMetricsAndLogs, 5000);
     </script>
 </body>
 </html>"""
