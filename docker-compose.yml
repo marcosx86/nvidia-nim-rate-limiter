@@ -5,19 +5,31 @@ services:
 
     environment:
       NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      RPM: ${RPM:-6.0}
+      WINDOW_SECONDS: ${WINDOW_SECONDS:-60.0}
+      BURST_CAPACITY: ${BURST_CAPACITY:-6.0}
+      MAX_CONCURRENT: ${MAX_CONCURRENT:-1}
+      UPSTREAM_URL: ${UPSTREAM_URL:-https://integrate.api.nvidia.com}
+      DB_PATH: ${DB_PATH:-limiter.db}
 
     restart: unless-stopped
 
     ports:
       - 8199:8000
 
-    read_only: true
-
-    tmpfs:
-      - /tmp
+    volumes:
+      - ./limiter.db:/app/limiter.db
+      - ./config.yaml:/app/config.yaml
 
     security_opt:
       - no-new-privileges:true
 
     cap_drop:
       - ALL
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

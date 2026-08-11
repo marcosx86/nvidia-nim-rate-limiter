@@ -2,13 +2,21 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir \
-    fastapi \
-    uvicorn[standard] \
-    httpx
+# Install curl for container healthcheck
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 
-COPY app.py .
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py database.py config.yaml ./
+
+# Create data directory with appropriate write permissions
+RUN mkdir -p /app/data && chown -R nobody:nogroup /app
 
 USER nobody
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/healthz || exit 1
 
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

@@ -1,0 +1,27 @@
+# Secrets & Environment
+.env
+*.env
+
+# SQLite Database & Storage
+*.db
+*.db-journal
+*.sqlite
+data/
+
+# Python Cache & Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
