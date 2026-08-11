@@ -5,21 +5,21 @@ services:
 
     environment:
       NVIDIA_API_KEY: ${NVIDIA_API_KEY}
-      RPM: ${RPM:-6.0}
+      RPM: ${RPM:-10.0}
       WINDOW_SECONDS: ${WINDOW_SECONDS:-60.0}
-      BURST_CAPACITY: ${BURST_CAPACITY:-6.0}
-      MAX_CONCURRENT: ${MAX_CONCURRENT:-1}
+      BURST_CAPACITY: ${BURST_CAPACITY:-10.0}
+      MAX_CONCURRENT: ${MAX_CONCURRENT:-2}
       UPSTREAM_URL: ${UPSTREAM_URL:-https://integrate.api.nvidia.com}
-      DB_PATH: ${DB_PATH:-limiter.db}
+      DB_PATH: ${DB_PATH:-data/limiter.db}
+      CONFIG_FILE: ${CONFIG_FILE:-data/config.yaml}
 
     restart: unless-stopped
 
     ports:
-      - 8199:8000
+      - "127.0.0.1:8199:8000"
 
     volumes:
-      - ./limiter.db:/app/limiter.db
-      - ./config.yaml:/app/config.yaml
+      - data:/app/data
 
     security_opt:
       - no-new-privileges:true
@@ -33,3 +33,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+
+volumes:
+  data:
+
