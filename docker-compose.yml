@@ -1,5 +1,6 @@
+name: nvidia-nim-ratelimit
 services:
-  nvidia-nim-ratelimit:
+  fastapi-proxy:
     build: .
     container_name: nvidia-nim-ratelimit
 
