@@ -3,9 +3,9 @@ admin:
 db:
   path: limiter.db
 proxy:
-  concurrency_limit: 2
+  concurrency_limit: 4
   upstream_url: https://integrate.api.nvidia.com
 rate_limit:
   burst_capacity: 10.0
-  requests_per_minute: 10.0
+  requests_per_minute: 35.0
   window_seconds: 60.0
