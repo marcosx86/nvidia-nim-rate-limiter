@@ -17,6 +17,7 @@
             --danger: #f85149;
             --warning: #d29922;
             --blue: #58a6ff;
+            --purple: #bc8cff;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -51,7 +52,7 @@
         }
         .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 16px;
             margin-bottom: 24px;
         }
@@ -93,15 +94,19 @@
             justify-content: space-between;
             align-items: center;
         }
+        .table-responsive {
+            overflow-x: auto;
+        }
         table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 0.9rem;
+            font-size: 0.88rem;
         }
         th, td {
             padding: 10px 12px;
             text-align: left;
             border-bottom: 1px solid var(--border);
+            white-space: nowrap;
         }
         th {
             color: var(--text-muted);
@@ -120,6 +125,22 @@
         .status-2xx { background: rgba(46, 160, 67, 0.2); color: #3fb950; }
         .status-4xx { background: rgba(210, 153, 34, 0.2); color: #d29922; }
         .status-5xx { background: rgba(248, 81, 73, 0.2); color: #f85149; }
+        
+        .model-badge {
+            background: rgba(88, 166, 255, 0.12);
+            color: var(--blue);
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-size: 0.78rem;
+            font-family: monospace;
+            border: 1px solid rgba(88, 166, 255, 0.25);
+        }
+        .token-count {
+            font-family: monospace;
+            font-size: 0.82rem;
+        }
+        .token-in { color: var(--blue); }
+        .token-out { color: var(--accent); }
         
         .form-group {
             margin-bottom: 14px;
@@ -154,10 +175,10 @@
         }
         .flex-container {
             display: grid;
-            grid-template-columns: 2fr 1fr;
+            grid-template-columns: 2.5fr 1fr;
             gap: 24px;
         }
-        @media (max-width: 900px) {
+        @media (max-width: 1024px) {
             .flex-container { grid-template-columns: 1fr; }
         }
     </style>
@@ -174,7 +195,7 @@
 
     <div class="grid">
         <div class="card">
-            <div class="card-title">Token Bucket Tokens</div>
+            <div class="card-title">Tokens Available</div>
             <div class="card-value" id="valTokens">-</div>
             <div class="card-sub" id="valCapacity">Capacity: -</div>
         </div>
@@ -182,6 +203,11 @@
             <div class="card-title">Total Requests</div>
             <div class="card-value" id="valTotalReq">-</div>
             <div class="card-sub" id="valRpmLastMin">RPM (Last Min): -</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Total Tokens (LLM)</div>
+            <div class="card-value" id="valTotalTokens">-</div>
+            <div class="card-sub" id="valTokensBreakdown">Prompt: - | Completion: -</div>
         </div>
         <div class="card">
             <div class="card-title">Avg Latency</div>
@@ -201,20 +227,24 @@
                 <span>Recent Request Logs</span>
                 <button class="btn" style="padding: 4px 10px; font-size: 0.8rem;" onclick="fetchMetricsAndLogs()">Refresh</button>
             </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Time</th>
-                        <th>Method</th>
-                        <th>Path</th>
-                        <th>Status</th>
-                        <th>Latency</th>
-                    </tr>
-                </thead>
-                <tbody id="logsBody">
-                    <tr><td colspan="5">Loading request logs...</td></tr>
-                </tbody>
-            </table>
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Method</th>
+                            <th>Path</th>
+                            <th>Model</th>
+                            <th>Tokens (In / Out)</th>
+                            <th>Status</th>
+                            <th>Latency</th>
+                        </tr>
+                    </thead>
+                    <tbody id="logsBody">
+                        <tr><td colspan="7">Loading request logs...</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
 
         <div class="section">
@@ -266,7 +296,7 @@
             try {
                 const [metricsRes, logsRes] = await Promise.all([
                     fetch('/admin/metrics'),
-                    fetch('/admin/logs?limit=10')
+                    fetch('/admin/logs?limit=15')
                 ]);
                 const metrics = await metricsRes.json();
                 const logsData = await logsRes.json();
@@ -275,6 +305,13 @@
                 document.getElementById('valCapacity').innerText = 'Capacity: ' + (metrics.capacity ?? '-');
                 document.getElementById('valTotalReq').innerText = metrics.total_requests ?? 0;
                 document.getElementById('valRpmLastMin').innerText = 'RPM (Last Min): ' + (metrics.rpm_last_minute ?? 0);
+                
+                const promptTok = metrics.total_prompt_tokens ?? 0;
+                const compTok = metrics.total_completion_tokens ?? 0;
+                const totalTok = metrics.total_tokens ?? (promptTok + compTok);
+                document.getElementById('valTotalTokens').innerText = totalTok.toLocaleString();
+                document.getElementById('valTokensBreakdown').innerText = `In: ${promptTok.toLocaleString()} | Out: ${compTok.toLocaleString()}`;
+
                 document.getElementById('valAvgLatency').innerText = metrics.avg_latency_ms ? Math.round(metrics.avg_latency_ms) + ' ms' : '0 ms';
                 document.getElementById('valConcurrency').innerText = metrics.active_concurrency ?? 0;
 
@@ -282,7 +319,7 @@
                 const tbody = document.getElementById('logsBody');
                 tbody.innerHTML = '';
                 if (!logsData.logs || logsData.logs.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5">No request logs recorded yet.</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="7">No request logs recorded yet.</td></tr>';
                 } else {
                     logsData.logs.forEach(log => {
                         const tr = document.createElement('tr');
@@ -291,10 +328,19 @@
                         if (log.status_code >= 400 && log.status_code < 500) statusClass = 'status-4xx';
                         if (log.status_code >= 500) statusClass = 'status-5xx';
 
+                        const modelHtml = log.model ? `<span class="model-badge">${log.model}</span>` : `<span style="color: var(--text-muted);">-</span>`;
+                        
+                        let tokensHtml = `<span style="color: var(--text-muted);">-</span>`;
+                        if (log.prompt_tokens > 0 || log.completion_tokens > 0 || log.total_tokens > 0) {
+                            tokensHtml = `<span class="token-count"><span class="token-in">${log.prompt_tokens || 0}</span> in / <span class="token-out">${log.completion_tokens || 0}</span> out</span>`;
+                        }
+
                         tr.innerHTML = `
                             <td>${dateStr}</td>
                             <td><strong>${log.method}</strong></td>
                             <td>${log.path}</td>
+                            <td>${modelHtml}</td>
+                            <td>${tokensHtml}</td>
                             <td><span class="status-tag ${statusClass}">${log.status_code}</span></td>
                             <td>${Math.round(log.latency_ms)} ms</td>
                         `;

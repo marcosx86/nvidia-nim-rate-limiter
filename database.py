@@ -10,23 +10,45 @@ CREATE TABLE IF NOT EXISTS request_logs (
     timestamp REAL NOT NULL,
     method TEXT NOT NULL,
     path TEXT NOT NULL,
+    model TEXT,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
     status_code INTEGER NOT NULL,
     latency_ms REAL NOT NULL,
     request_bytes INTEGER NOT NULL DEFAULT 0,
     response_bytes INTEGER NOT NULL DEFAULT 0,
     allowed INTEGER NOT NULL DEFAULT 1
 );
+"""
 
+CREATE_INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_timestamp ON request_logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_path ON request_logs(path);
+CREATE INDEX IF NOT EXISTS idx_model ON request_logs(model);
 CREATE INDEX IF NOT EXISTS idx_status_code ON request_logs(status_code);
 """
 
 
 async def init_db(db_path: str) -> None:
-    """Initialize the SQLite database schema."""
+    """Initialize the SQLite database schema and migrate existing tables if needed."""
     async with aiosqlite.connect(db_path) as db:
-        await db.executescript(CREATE_TABLE_SQL)
+        await db.execute(CREATE_TABLE_SQL)
+
+        # Ensure schema migrations for existing databases
+        async with db.execute("PRAGMA table_info(request_logs)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+
+        if "model" not in columns:
+            await db.execute("ALTER TABLE request_logs ADD COLUMN model TEXT")
+        if "prompt_tokens" not in columns:
+            await db.execute("ALTER TABLE request_logs ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0")
+        if "completion_tokens" not in columns:
+            await db.execute("ALTER TABLE request_logs ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0")
+        if "total_tokens" not in columns:
+            await db.execute("ALTER TABLE request_logs ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0")
+
+        await db.executescript(CREATE_INDEXES_SQL)
         await db.commit()
 
 
@@ -39,19 +61,33 @@ async def log_request(
     request_bytes: int = 0,
     response_bytes: int = 0,
     allowed: bool = True,
+    model: Optional[str] = None,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
 ) -> None:
     """Record a proxy request log entry asynchronously."""
     now = time.time()
+    if total_tokens == 0 and (prompt_tokens > 0 or completion_tokens > 0):
+        total_tokens = prompt_tokens + completion_tokens
+
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
             """
-            INSERT INTO request_logs (timestamp, method, path, status_code, latency_ms, request_bytes, response_bytes, allowed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO request_logs (
+                timestamp, method, path, model, prompt_tokens, completion_tokens,
+                total_tokens, status_code, latency_ms, request_bytes, response_bytes, allowed
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now,
                 method,
                 path,
+                model,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
                 status_code,
                 latency_ms,
                 request_bytes,
@@ -67,7 +103,7 @@ async def get_metrics(db_path: str) -> Dict[str, Any]:
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
 
-        # Total count & latency stats
+        # Total count, tokens & latency stats
         async with db.execute(
             """
             SELECT 
@@ -76,7 +112,10 @@ async def get_metrics(db_path: str) -> Dict[str, Any]:
                 SUM(CASE WHEN allowed = 0 THEN 1 ELSE 0 END) as throttled_requests,
                 AVG(CASE WHEN allowed = 1 THEN latency_ms ELSE NULL END) as avg_latency_ms,
                 SUM(request_bytes) as total_request_bytes,
-                SUM(response_bytes) as total_response_bytes
+                SUM(response_bytes) as total_response_bytes,
+                SUM(prompt_tokens) as total_prompt_tokens,
+                SUM(completion_tokens) as total_completion_tokens,
+                SUM(total_tokens) as total_tokens
             FROM request_logs
             """
         ) as cursor:
@@ -114,9 +153,14 @@ async def get_logs(
     offset: int = 0,
     status_code: Optional[int] = None,
     path: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Retrieve paginated request logs."""
-    query = "SELECT id, timestamp, method, path, status_code, latency_ms, request_bytes, response_bytes, allowed FROM request_logs"
+    """Retrieve paginated request logs with model and token counts."""
+    query = """
+    SELECT id, timestamp, method, path, model, prompt_tokens, completion_tokens,
+           total_tokens, status_code, latency_ms, request_bytes, response_bytes, allowed 
+    FROM request_logs
+    """
     conditions = []
     params: List[Any] = []
 
@@ -127,6 +171,10 @@ async def get_logs(
     if path is not None:
         conditions.append("path LIKE ?")
         params.append(f"%{path}%")
+
+    if model is not None:
+        conditions.append("model LIKE ?")
+        params.append(f"%{model}%")
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)

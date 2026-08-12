@@ -5,7 +5,7 @@ import pytest_asyncio
 from fastapi.testclient import TestClient
 
 import database
-from app import app, token_bucket, load_config, save_config, TokenBucket
+from app import app, token_bucket, load_config, save_config, TokenBucket, extract_tokens
 
 TEST_DB = "test_limiter.db"
 
@@ -16,6 +16,22 @@ def setup_test_db():
     yield
     if os.path.exists(TEST_DB):
         os.remove(TEST_DB)
+
+
+def test_extract_tokens():
+    # Standard JSON
+    json_text = '{"id":"chat-1","choices":[],"usage":{"prompt_tokens":120,"completion_tokens":45,"total_tokens":165}}'
+    p, c, t = extract_tokens(json_text)
+    assert p == 120
+    assert c == 45
+    assert t == 165
+
+    # SSE Chunk Stream Text
+    sse_text = 'data: {"id":"chat-1","choices":[{"delta":{"content":"Hi"}}],"usage":{"prompt_tokens":85,"completion_tokens":12}}\n\ndata: [DONE]\n\n'
+    p, c, t = extract_tokens(sse_text)
+    assert p == 85
+    assert c == 12
+    assert t == 97
 
 
 @pytest.mark.asyncio
@@ -30,17 +46,28 @@ async def test_database_logging():
         request_bytes=50,
         response_bytes=200,
         allowed=True,
+        model="z-ai/glm-5.2",
+        prompt_tokens=150,
+        completion_tokens=42,
+        total_tokens=192,
     )
     
     logs = await database.get_logs(TEST_DB)
     assert len(logs) == 1
     assert logs[0]["method"] == "POST"
     assert logs[0]["path"] == "/v1/chat/completions"
+    assert logs[0]["model"] == "z-ai/glm-5.2"
+    assert logs[0]["prompt_tokens"] == 150
+    assert logs[0]["completion_tokens"] == 42
+    assert logs[0]["total_tokens"] == 192
     assert logs[0]["status_code"] == 200
 
     metrics = await database.get_metrics(TEST_DB)
     assert metrics["total_requests"] == 1
     assert metrics["allowed_requests"] == 1
+    assert metrics["total_prompt_tokens"] == 150
+    assert metrics["total_completion_tokens"] == 42
+    assert metrics["total_tokens"] == 192
     assert metrics["status_codes"][200] == 1
 
 

@@ -1,9 +1,10 @@
 import asyncio
 import json
 import os
+import re
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 import yaml
@@ -15,6 +16,39 @@ import database
 
 CONFIG_FILE = os.getenv("CONFIG_FILE", "config.yaml")
 WWWROOT_DIR = os.getenv("WWWROOT_DIR", "wwwroot")
+
+
+def extract_tokens(text: str) -> Tuple[int, int, int]:
+    """Extract prompt, completion, and total tokens from JSON or SSE streaming response text."""
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
+    if not text:
+        return 0, 0, 0
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and "usage" in data and isinstance(data["usage"], dict):
+            u = data["usage"]
+            prompt_tokens = int(u.get("prompt_tokens") or 0)
+            completion_tokens = int(u.get("completion_tokens") or 0)
+            total_tokens = int(u.get("total_tokens") or (prompt_tokens + completion_tokens))
+            return prompt_tokens, completion_tokens, total_tokens
+    except Exception:
+        pass
+
+    p_match = re.findall(r'"prompt_tokens"\s*:\s*(\d+)', text)
+    if p_match:
+        prompt_tokens = int(p_match[-1])
+    c_match = re.findall(r'"completion_tokens"\s*:\s*(\d+)', text)
+    if c_match:
+        completion_tokens = int(c_match[-1])
+    t_match = re.findall(r'"total_tokens"\s*:\s*(\d+)', text)
+    if t_match:
+        total_tokens = int(t_match[-1])
+    elif prompt_tokens or completion_tokens:
+        total_tokens = prompt_tokens + completion_tokens
+
+    return prompt_tokens, completion_tokens, total_tokens
 
 # --- Configuration Management ---
 def load_config() -> Dict[str, Any]:
@@ -189,9 +223,22 @@ async def admin_metrics():
 
 
 @app.get("/admin/logs", tags=["Admin"])
-async def admin_logs(limit: int = 50, offset: int = 0, status_code: Optional[int] = None, path: Optional[str] = None):
+async def admin_logs(
+    limit: int = 50,
+    offset: int = 0,
+    status_code: Optional[int] = None,
+    path: Optional[str] = None,
+    model: Optional[str] = None,
+):
     db_path = config_data["db"]["path"]
-    logs = await database.get_logs(db_path, limit=limit, offset=offset, status_code=status_code, path=path)
+    logs = await database.get_logs(
+        db_path,
+        limit=limit,
+        offset=offset,
+        status_code=status_code,
+        path=path,
+        model=model,
+    )
     return {"logs": logs, "limit": limit, "offset": offset}
 
 
@@ -266,6 +313,15 @@ async def proxy_request(path: str, request: Request):
         except (ClientDisconnect, asyncio.CancelledError):
             return Response(status_code=499)
 
+        model_name = None
+        if body:
+            try:
+                body_json = json.loads(body.decode("utf-8"))
+                if isinstance(body_json, dict):
+                    model_name = body_json.get("model")
+            except Exception:
+                pass
+
         headers = dict(request.headers)
 
         # Never forward client's Authorization header
@@ -302,15 +358,20 @@ async def proxy_request(path: str, request: Request):
 
             async def stream_generator():
                 bytes_count = 0
+                collected_chunks = []
                 try:
                     async for chunk in upstream_response.aiter_bytes():
                         bytes_count += len(chunk)
+                        if len(collected_chunks) < 40 or b"usage" in chunk or b"prompt_tokens" in chunk:
+                            collected_chunks.append(chunk)
                         yield chunk
                 except (ClientDisconnect, asyncio.CancelledError):
                     pass
                 finally:
                     await upstream_response.aclose()
                     latency_ms = (time.time() - start_time) * 1000.0
+                    response_text = b"".join(collected_chunks).decode("utf-8", errors="ignore")
+                    prompt_tokens, completion_tokens, total_tokens = extract_tokens(response_text)
                     asyncio.create_task(
                         database.log_request(
                             db_path=db_path,
@@ -321,6 +382,10 @@ async def proxy_request(path: str, request: Request):
                             request_bytes=len(body),
                             response_bytes=bytes_count,
                             allowed=True,
+                            model=model_name,
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            total_tokens=total_tokens,
                         )
                     )
 
@@ -345,6 +410,7 @@ async def proxy_request(path: str, request: Request):
                     request_bytes=len(body),
                     response_bytes=0,
                     allowed=True,
+                    model=model_name,
                 )
             )
             return JSONResponse(
