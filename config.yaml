@@ -1,11 +1,11 @@
 admin:
-  title: NVIDIA NIM Rate Limiter Dashboard
+  title: Custom Agent Rate Limiter
 db:
   path: limiter.db
 proxy:
-  concurrency_limit: 4
+  concurrency_limit: 2
   upstream_url: https://integrate.api.nvidia.com
 rate_limit:
   burst_capacity: 10.0
-  requests_per_minute: 35.0
+  requests_per_minute: 10.0
   window_seconds: 60.0

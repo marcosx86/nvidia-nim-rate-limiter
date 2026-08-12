@@ -251,6 +251,8 @@ async def get_admin_config():
 async def update_admin_config(new_config: Dict[str, Any]):
     global config_data, concurrency_semaphore
     try:
+        if "admin" in new_config:
+            config_data["admin"].update(new_config["admin"])
         if "proxy" in new_config:
             config_data["proxy"].update(new_config["proxy"])
         if "rate_limit" in new_config:
@@ -280,7 +282,10 @@ async def admin_dashboard():
     index_file = os.path.join(WWWROOT_DIR, "index.html")
     if os.path.exists(index_file):
         with open(index_file, "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
+            content = f.read()
+            title = config_data.get("admin", {}).get("title", "NVIDIA NIM Rate Limiter Dashboard")
+            content = content.replace("{{ ADMIN_TITLE }}", title)
+            return HTMLResponse(content=content)
     return HTMLResponse(
         content="<h1>Admin Dashboard</h1><p>wwwroot/index.html not found.</p>",
         status_code=404,

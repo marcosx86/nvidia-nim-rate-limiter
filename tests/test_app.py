@@ -109,15 +109,19 @@ def test_admin_dashboard_and_config():
         # Dashboard HTML
         resp_html = client.get("/admin/")
         assert resp_html.status_code == 200
-        assert "<title>NVIDIA NIM Proxy Admin Dashboard</title>" in resp_html.text
+        assert "<title>NVIDIA NIM Rate Limiter Dashboard</title>" in resp_html.text
 
         # Get config
         resp_cfg = client.get("/admin/config")
         assert resp_cfg.status_code == 200
         assert "proxy" in resp_cfg.json()
+        assert "admin" in resp_cfg.json()
 
-        # Update config
+        # Update config including custom title
         update_payload = {
+            "admin": {
+                "title": "Custom Agent Rate Limiter"
+            },
             "rate_limit": {
                 "requests_per_minute": 10.0,
                 "window_seconds": 60.0,
@@ -131,6 +135,10 @@ def test_admin_dashboard_and_config():
         resp_post = client.post("/admin/config", json=update_payload)
         assert resp_post.status_code == 200
         assert resp_post.json()["status"] == "updated"
+
+        # Verify updated HTML title
+        resp_html_updated = client.get("/admin/")
+        assert "<title>Custom Agent Rate Limiter</title>" in resp_html_updated.text
 
         # Verify updated metrics endpoint
         resp_metrics = client.get("/admin/metrics")

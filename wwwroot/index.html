@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NVIDIA NIM Proxy Admin Dashboard</title>
+    <title>{{ ADMIN_TITLE }}</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -188,7 +188,7 @@
     <div class="header">
         <h1>
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
-            NVIDIA NIM Rate Limiter
+            <span id="headerTitle">{{ ADMIN_TITLE }}</span>
         </h1>
         <span class="badge" id="statusBadge">Active</span>
     </div>
@@ -248,8 +248,12 @@
         </div>
 
         <div class="section">
-            <div class="section-title">Rate Limit Config</div>
+            <div class="section-title">Configuration</div>
             <form id="configForm" onsubmit="saveConfig(event)">
+                <div class="form-group">
+                    <label>Dashboard Title</label>
+                    <input type="text" id="cfgTitle" required>
+                </div>
                 <div class="form-group">
                     <label>Requests Per Minute (RPM)</label>
                     <input type="number" step="0.1" id="cfgRpm" required>
@@ -280,6 +284,11 @@
             try {
                 const configRes = await fetch('/admin/config');
                 const config = await configRes.json();
+
+                const title = config.admin?.title || 'NVIDIA NIM Rate Limiter Dashboard';
+                document.title = title;
+                document.getElementById('headerTitle').innerText = title;
+                document.getElementById('cfgTitle').value = title;
 
                 document.getElementById('cfgRpm').value = config.rate_limit?.requests_per_minute ?? 6;
                 document.getElementById('cfgWindow').value = config.rate_limit?.window_seconds ?? 60;
@@ -355,6 +364,9 @@
         async function saveConfig(e) {
             e.preventDefault();
             const payload = {
+                admin: {
+                    title: document.getElementById('cfgTitle').value
+                },
                 rate_limit: {
                     requests_per_minute: parseFloat(document.getElementById('cfgRpm').value),
                     window_seconds: parseFloat(document.getElementById('cfgWindow').value),
