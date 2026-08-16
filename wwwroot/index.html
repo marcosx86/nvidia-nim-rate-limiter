@@ -94,6 +94,111 @@
             justify-content: space-between;
             align-items: center;
         }
+        .section-header-wrap {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .controls-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .filter-bar {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: rgba(0, 0, 0, 0.25);
+            padding: 4px 6px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            flex-wrap: wrap;
+        }
+        .filter-sep {
+            display: inline-block;
+            width: 1px;
+            height: 16px;
+            background-color: var(--border);
+            margin: 0 2px;
+        }
+        .filter-pill {
+            background-color: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            font-size: 0.75rem;
+            font-weight: 500;
+            padding: 3px 9px;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.15s ease-in-out;
+            user-select: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            line-height: 1.2;
+        }
+        .filter-pill:hover {
+            color: #fff;
+            border-color: rgba(255, 255, 255, 0.3);
+            background: rgba(255, 255, 255, 0.05);
+        }
+        .filter-pill.active {
+            font-weight: 600;
+        }
+        .filter-pill.active-method {
+            background: rgba(88, 166, 255, 0.18);
+            color: #58a6ff;
+            border-color: #58a6ff;
+            box-shadow: 0 0 6px rgba(88, 166, 255, 0.2);
+        }
+        .filter-pill.active-success {
+            background: rgba(46, 160, 67, 0.18);
+            color: #3fb950;
+            border-color: #3fb950;
+            box-shadow: 0 0 6px rgba(46, 160, 67, 0.2);
+        }
+        .filter-pill.active-error {
+            background: rgba(248, 81, 73, 0.18);
+            color: #f85149;
+            border-color: #f85149;
+            box-shadow: 0 0 6px rgba(248, 81, 73, 0.2);
+        }
+        .filter-pill.active-model {
+            background: rgba(188, 140, 255, 0.18);
+            color: #bc8cff;
+            border-color: #bc8cff;
+            box-shadow: 0 0 6px rgba(188, 140, 255, 0.2);
+        }
+        .model-pill-tag {
+            font-family: monospace;
+            max-width: 140px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .btn-clear-filters {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 0.72rem;
+            text-decoration: underline;
+            cursor: pointer;
+            padding: 2px 4px;
+        }
+        .btn-clear-filters:hover {
+            color: #fff;
+        }
+        .btn-refresh {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 5px 12px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
         .table-responsive {
             overflow-x: auto;
         }
@@ -223,9 +328,23 @@
 
     <div class="flex-container">
         <div class="section">
-            <div class="section-title">
+            <div class="section-title section-header-wrap">
                 <span>Recent Request Logs</span>
-                <button class="btn" style="padding: 4px 10px; font-size: 0.8rem;" onclick="fetchMetricsAndLogs()">Refresh</button>
+                <div class="controls-group">
+                    <div class="filter-bar" id="filterBar">
+                        <button class="filter-pill" id="filter-get" onclick="toggleFilter('method', 'GET')">GET</button>
+                        <button class="filter-pill" id="filter-post" onclick="toggleFilter('method', 'POST')">POST</button>
+                        <span class="filter-sep"></span>
+                        <button class="filter-pill" id="filter-success" onclick="toggleFilter('status', 'success')">Success (2xx/3xx)</button>
+                        <button class="filter-pill" id="filter-errors" onclick="toggleFilter('status', 'error')">Errors (4xx/5xx)</button>
+                        <span id="modelFiltersContainer" style="display: contents;"></span>
+                        <button id="btnClearFilters" class="btn-clear-filters" style="display: none;" onclick="clearAllFilters()">Reset</button>
+                    </div>
+                    <button class="btn btn-refresh" onclick="fetchMetricsAndLogs()">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
+                        Refresh
+                    </button>
+                </div>
             </div>
             <div class="table-responsive">
                 <table>
@@ -280,6 +399,187 @@
     </div>
 
     <script>
+        let allLogs = [];
+        let recentModelsList = [];
+        const activeFilters = {
+            methods: new Set(),
+            statuses: new Set(),
+            models: new Set()
+        };
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
+        function toggleFilter(type, value) {
+            if (type === 'method') {
+                if (activeFilters.methods.has(value)) {
+                    activeFilters.methods.delete(value);
+                } else {
+                    activeFilters.methods.add(value);
+                }
+            } else if (type === 'status') {
+                if (activeFilters.statuses.has(value)) {
+                    activeFilters.statuses.delete(value);
+                } else {
+                    activeFilters.statuses.add(value);
+                }
+            } else if (type === 'model') {
+                if (activeFilters.models.has(value)) {
+                    activeFilters.models.delete(value);
+                } else {
+                    activeFilters.models.add(value);
+                }
+            }
+            updateFilterUI();
+            renderLogsTable();
+        }
+
+        function clearAllFilters() {
+            activeFilters.methods.clear();
+            activeFilters.statuses.clear();
+            activeFilters.models.clear();
+            updateFilterUI();
+            renderLogsTable();
+        }
+
+        function updateFilterUI() {
+            const btnGet = document.getElementById('filter-get');
+            if (btnGet) {
+                btnGet.className = 'filter-pill' + (activeFilters.methods.has('GET') ? ' active active-method' : '');
+            }
+            const btnPost = document.getElementById('filter-post');
+            if (btnPost) {
+                btnPost.className = 'filter-pill' + (activeFilters.methods.has('POST') ? ' active active-method' : '');
+            }
+
+            const btnSuccess = document.getElementById('filter-success');
+            if (btnSuccess) {
+                btnSuccess.className = 'filter-pill' + (activeFilters.statuses.has('success') ? ' active active-success' : '');
+            }
+            const btnErrors = document.getElementById('filter-errors');
+            if (btnErrors) {
+                btnErrors.className = 'filter-pill' + (activeFilters.statuses.has('error') ? ' active active-error' : '');
+            }
+
+            const modelButtons = document.querySelectorAll('.filter-model-btn');
+            modelButtons.forEach(btn => {
+                const model = btn.getAttribute('data-model');
+                if (activeFilters.models.has(model)) {
+                    btn.className = 'filter-pill filter-model-btn active active-model';
+                } else {
+                    btn.className = 'filter-pill filter-model-btn';
+                }
+            });
+
+            const totalActive = activeFilters.methods.size + activeFilters.statuses.size + activeFilters.models.size;
+            const btnClear = document.getElementById('btnClearFilters');
+            if (btnClear) {
+                btnClear.style.display = totalActive > 0 ? 'inline-block' : 'none';
+            }
+        }
+
+        function renderModelButtons(models) {
+            recentModelsList = models || [];
+            const container = document.getElementById('modelFiltersContainer');
+            if (!container) return;
+
+            if (recentModelsList.length === 0) {
+                container.innerHTML = '';
+                return;
+            }
+
+            let html = '<span class="filter-sep"></span>';
+            recentModelsList.forEach(model => {
+                const isActive = activeFilters.models.has(model);
+                const activeCls = isActive ? ' active active-model' : '';
+                const safeModel = escapeHtml(model);
+                const displayLabel = model.length > 22 ? model.slice(0, 20) + '…' : model;
+                html += `<button class="filter-pill filter-model-btn${activeCls}" data-model="${safeModel}" onclick="toggleFilter('model', '${safeModel.replace(/'/g, "\\'")}')" title="Filter by model: ${safeModel}">
+                    <span class="model-pill-tag">${escapeHtml(displayLabel)}</span>
+                </button>`;
+            });
+            container.innerHTML = html;
+        }
+
+        function filterLog(log) {
+            if (activeFilters.methods.size > 0) {
+                if (!activeFilters.methods.has(log.method.toUpperCase())) {
+                    return false;
+                }
+            }
+
+            if (activeFilters.statuses.size > 0) {
+                const isSuccess = log.status_code >= 200 && log.status_code < 400;
+                const isError = log.status_code >= 400;
+                let match = false;
+                if (activeFilters.statuses.has('success') && isSuccess) match = true;
+                if (activeFilters.statuses.has('error') && isError) match = true;
+                if (!match) return false;
+            }
+
+            if (activeFilters.models.size > 0) {
+                if (!log.model || !activeFilters.models.has(log.model)) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        function renderLogsTable() {
+            const tbody = document.getElementById('logsBody');
+            if (!tbody) return;
+
+            if (!allLogs || allLogs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 20px;">No request logs recorded yet.</td></tr>';
+                return;
+            }
+
+            const filtered = allLogs.filter(filterLog);
+
+            if (filtered.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 24px;">
+                    No request logs match the selected filters. 
+                    <button class="btn-clear-filters" style="display:inline; margin-left: 6px;" onclick="clearAllFilters()">Clear filters</button>
+                </td></tr>`;
+                return;
+            }
+
+            tbody.innerHTML = '';
+            filtered.forEach(log => {
+                const tr = document.createElement('tr');
+                const dateStr = new Date(log.timestamp * 1000).toLocaleTimeString();
+                let statusClass = 'status-2xx';
+                if (log.status_code >= 400 && log.status_code < 500) statusClass = 'status-4xx';
+                if (log.status_code >= 500) statusClass = 'status-5xx';
+
+                const modelHtml = log.model ? `<span class="model-badge">${escapeHtml(log.model)}</span>` : `<span style="color: var(--text-muted);">-</span>`;
+                
+                let tokensHtml = `<span style="color: var(--text-muted);">-</span>`;
+                if (log.prompt_tokens > 0 || log.completion_tokens > 0 || log.total_tokens > 0) {
+                    tokensHtml = `<span class="token-count"><span class="token-in">${(log.prompt_tokens || 0).toLocaleString()}</span> in / <span class="token-out">${(log.completion_tokens || 0).toLocaleString()}</span> out</span>`;
+                }
+
+                tr.innerHTML = `
+                    <td>${dateStr}</td>
+                    <td><strong>${escapeHtml(log.method)}</strong></td>
+                    <td>${escapeHtml(log.path)}</td>
+                    <td>${modelHtml}</td>
+                    <td>${tokensHtml}</td>
+                    <td><span class="status-tag ${statusClass}">${log.status_code}</span></td>
+                    <td>${Math.round(log.latency_ms)} ms</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
         async function loadConfigForm() {
             try {
                 const configRes = await fetch('/admin/config');
@@ -305,7 +605,7 @@
             try {
                 const [metricsRes, logsRes] = await Promise.all([
                     fetch('/admin/metrics'),
-                    fetch('/admin/logs?limit=15')
+                    fetch('/admin/logs?limit=100')
                 ]);
                 const metrics = await metricsRes.json();
                 const logsData = await logsRes.json();
@@ -324,38 +624,14 @@
                 document.getElementById('valAvgLatency').innerText = metrics.avg_latency_ms ? Math.round(metrics.avg_latency_ms) + ' ms' : '0 ms';
                 document.getElementById('valConcurrency').innerText = metrics.active_concurrency ?? 0;
 
-                // Fill Logs
-                const tbody = document.getElementById('logsBody');
-                tbody.innerHTML = '';
-                if (!logsData.logs || logsData.logs.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="7">No request logs recorded yet.</td></tr>';
-                } else {
-                    logsData.logs.forEach(log => {
-                        const tr = document.createElement('tr');
-                        const dateStr = new Date(log.timestamp * 1000).toLocaleTimeString();
-                        let statusClass = 'status-2xx';
-                        if (log.status_code >= 400 && log.status_code < 500) statusClass = 'status-4xx';
-                        if (log.status_code >= 500) statusClass = 'status-5xx';
+                // Update recent models filters
+                const models = logsData.recent_models || metrics.recent_models || [];
+                renderModelButtons(models);
 
-                        const modelHtml = log.model ? `<span class="model-badge">${log.model}</span>` : `<span style="color: var(--text-muted);">-</span>`;
-                        
-                        let tokensHtml = `<span style="color: var(--text-muted);">-</span>`;
-                        if (log.prompt_tokens > 0 || log.completion_tokens > 0 || log.total_tokens > 0) {
-                            tokensHtml = `<span class="token-count"><span class="token-in">${log.prompt_tokens || 0}</span> in / <span class="token-out">${log.completion_tokens || 0}</span> out</span>`;
-                        }
-
-                        tr.innerHTML = `
-                            <td>${dateStr}</td>
-                            <td><strong>${log.method}</strong></td>
-                            <td>${log.path}</td>
-                            <td>${modelHtml}</td>
-                            <td>${tokensHtml}</td>
-                            <td><span class="status-tag ${statusClass}">${log.status_code}</span></td>
-                            <td>${Math.round(log.latency_ms)} ms</td>
-                        `;
-                        tbody.appendChild(tr);
-                    });
-                }
+                // Update logs
+                allLogs = logsData.logs || [];
+                updateFilterUI();
+                renderLogsTable();
             } catch (err) {
                 console.error('Error fetching metrics/logs:', err);
             }

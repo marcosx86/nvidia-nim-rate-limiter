@@ -1,7 +1,6 @@
 import asyncio
 import os
 import pytest
-import pytest_asyncio
 from fastapi.testclient import TestClient
 
 import database
@@ -104,12 +103,91 @@ def test_status():
         assert "concurrency" in data
 
 
+@pytest.mark.asyncio
+async def test_recent_models_with_tokens():
+    await database.init_db(TEST_DB)
+    # Model 1 with tokens
+    await database.log_request(
+        db_path=TEST_DB,
+        method="POST",
+        path="/v1/chat/completions",
+        status_code=200,
+        latency_ms=100.0,
+        model="meta/llama-3.1-8b-instruct",
+        prompt_tokens=10,
+        completion_tokens=5,
+        total_tokens=15,
+    )
+    # Model 2 without tokens (should not be included)
+    await database.log_request(
+        db_path=TEST_DB,
+        method="GET",
+        path="/v1/models",
+        status_code=200,
+        latency_ms=20.0,
+        model="no-token-model",
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+    )
+    # Model 3 with tokens
+    await database.log_request(
+        db_path=TEST_DB,
+        method="POST",
+        path="/v1/chat/completions",
+        status_code=200,
+        latency_ms=150.0,
+        model="mistralai/mixtral-8x7b-instruct-v0.1",
+        prompt_tokens=50,
+        completion_tokens=20,
+        total_tokens=70,
+    )
+    # Model 4 with tokens
+    await database.log_request(
+        db_path=TEST_DB,
+        method="POST",
+        path="/v1/chat/completions",
+        status_code=200,
+        latency_ms=200.0,
+        model="deepseek-ai/deepseek-r1",
+        prompt_tokens=80,
+        completion_tokens=40,
+        total_tokens=120,
+    )
+    # Model 5 with tokens (most recent)
+    await database.log_request(
+        db_path=TEST_DB,
+        method="POST",
+        path="/v1/chat/completions",
+        status_code=200,
+        latency_ms=110.0,
+        model="meta/llama-3.3-70b-instruct",
+        prompt_tokens=100,
+        completion_tokens=50,
+        total_tokens=150,
+    )
+
+    models = await database.get_recent_models_with_tokens(TEST_DB, limit=3)
+    assert len(models) == 3
+    # Ordered by most recent: llama-3.3-70b, deepseek-r1, mixtral-8x7b
+    assert models[0] == "meta/llama-3.3-70b-instruct"
+    assert models[1] == "deepseek-ai/deepseek-r1"
+    assert models[2] == "mistralai/mixtral-8x7b-instruct-v0.1"
+
+    metrics = await database.get_metrics(TEST_DB)
+    assert metrics["recent_models"] == models
+
+
 def test_admin_dashboard_and_config():
     with TestClient(app) as client:
-        # Dashboard HTML
+        # Dashboard HTML contains the filter buttons
         resp_html = client.get("/admin/")
         assert resp_html.status_code == 200
-        assert "<title>NVIDIA NIM Rate Limiter Dashboard</title>" in resp_html.text
+        assert "filter-get" in resp_html.text
+        assert "filter-post" in resp_html.text
+        assert "Success (2xx/3xx)" in resp_html.text
+        assert "Errors (4xx/5xx)" in resp_html.text
+        assert "modelFiltersContainer" in resp_html.text
 
         # Get config
         resp_cfg = client.get("/admin/config")
@@ -144,3 +222,5 @@ def test_admin_dashboard_and_config():
         resp_metrics = client.get("/admin/metrics")
         assert resp_metrics.status_code == 200
         assert "total_requests" in resp_metrics.json()
+        assert "recent_models" in resp_metrics.json()
+

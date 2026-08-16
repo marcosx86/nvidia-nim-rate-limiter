@@ -144,7 +144,44 @@ async def get_metrics(db_path: str) -> Dict[str, Any]:
             status_breakdown = {row["status_code"]: row["count"] for row in rows}
             summary["status_codes"] = status_breakdown
 
+        # Last 3 used models with tokens
+        async with db.execute(
+            """
+            SELECT model
+            FROM request_logs
+            WHERE model IS NOT NULL 
+              AND model != '' 
+              AND (prompt_tokens > 0 OR completion_tokens > 0 OR total_tokens > 0)
+            GROUP BY model
+            ORDER BY MAX(id) DESC
+            LIMIT 3
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+            summary["recent_models"] = [row["model"] for row in rows]
+
         return summary
+
+
+async def get_recent_models_with_tokens(db_path: str, limit: int = 3) -> List[str]:
+    """Retrieve the last N distinct models that had tokens recorded."""
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT model
+            FROM request_logs
+            WHERE model IS NOT NULL 
+              AND model != '' 
+              AND (prompt_tokens > 0 OR completion_tokens > 0 OR total_tokens > 0)
+            GROUP BY model
+            ORDER BY MAX(id) DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row["model"] for row in rows]
 
 
 async def get_logs(

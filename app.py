@@ -239,7 +239,8 @@ async def admin_logs(
         path=path,
         model=model,
     )
-    return {"logs": logs, "limit": limit, "offset": offset}
+    recent_models = await database.get_recent_models_with_tokens(db_path, limit=3)
+    return {"logs": logs, "limit": limit, "offset": offset, "recent_models": recent_models}
 
 
 @app.get("/admin/config", tags=["Admin"])
