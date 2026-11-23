@@ -2,20 +2,20 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import httpx
+import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
 import database
-
-CONFIG_FILE = os.getenv("CONFIG_FILE", "config.yaml")
-WWWROOT_DIR = os.getenv("WWWROOT_DIR", "wwwroot")
+from settings import AppSettings, ConfigError, build_arg_parser, resolve_settings
 
 
 def extract_tokens(text: str) -> Tuple[int, int, int]:
@@ -50,55 +50,39 @@ def extract_tokens(text: str) -> Tuple[int, int, int]:
 
     return prompt_tokens, completion_tokens, total_tokens
 
+
 # --- Configuration Management ---
-def load_config() -> Dict[str, Any]:
-    config: Dict[str, Any] = {
-        "proxy": {
-            "upstream_url": os.getenv("UPSTREAM_URL", "https://integrate.api.nvidia.com"),
-            "concurrency_limit": int(os.getenv("MAX_CONCURRENT", "1")),
-        },
-        "rate_limit": {
-            "requests_per_minute": float(os.getenv("RPM", "6.0")),
-            "window_seconds": float(os.getenv("WINDOW_SECONDS", "60.0")),
-            "burst_capacity": float(os.getenv("BURST_CAPACITY", "6.0")),
-        },
-        "db": {
-            "path": os.getenv("DB_PATH", "limiter.db"),
-        },
-        "admin": {
-            "title": "NVIDIA NIM Rate Limiter Dashboard",
-        },
-    }
-
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                file_config = yaml.safe_load(f) or {}
-                # Merge file config
-                if "proxy" in file_config:
-                    config["proxy"].update(file_config["proxy"])
-                if "rate_limit" in file_config:
-                    config["rate_limit"].update(file_config["rate_limit"])
-                if "db" in file_config:
-                    config["db"].update(file_config["db"])
-                if "admin" in file_config:
-                    config["admin"].update(file_config["admin"])
-        except Exception as e:
-            print(f"Warning: Failed to load {CONFIG_FILE}: {e}")
-
-    # Ensure config file exists with defaults if not present
-    if not os.path.exists(CONFIG_FILE):
-        save_config(config)
-
-    return config
-
-
-def save_config(config: Dict[str, Any]) -> None:
+def save_config(config: Dict[str, Any], config_file: Optional[str] = None) -> None:
+    target = config_file or CONFIG_FILE
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
             yaml.safe_dump(config, f, default_flow_style=False)
     except Exception as e:
-        print(f"Error saving configuration to {CONFIG_FILE}: {e}")
+        print(f"Error saving configuration to {target}: {e}")
+
+
+def load_config(
+    argv: Optional[Sequence[str]] = None,
+    environ: Optional[Mapping[str, str]] = None,
+    *,
+    require_secrets: bool = False,
+) -> Dict[str, Any]:
+    """Load non-secret runtime configuration using strict precedence:
+    argparse > environment var > dotenv > config.yaml > default.
+    """
+    resolved = resolve_settings(
+        argv=argv,
+        environ=environ,
+        allow_yaml_fallback=True,
+        require_secrets=require_secrets,
+    )
+    cfg = resolved.to_config_dict()
+    if not os.path.exists(resolved.config_file):
+        save_config(cfg, resolved.config_file)
+    return cfg
 
 
 # --- Token Bucket Rate Limiter ---
@@ -138,8 +122,16 @@ class TokenBucket:
 
 
 # --- Global State ---
-config_data = load_config()
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
+runtime_settings: AppSettings = resolve_settings(
+    argv=[],
+    allow_yaml_fallback=True,
+    require_secrets=False,
+)
+CONFIG_FILE: str = runtime_settings.config_file
+WWWROOT_DIR: str = runtime_settings.wwwroot_dir
+config_data: Dict[str, Any] = runtime_settings.to_config_dict()
+NVIDIA_API_KEY: str = runtime_settings.nvidia_api_key
+_cli_configured: bool = False
 
 token_bucket = TokenBucket(
     rpm=config_data["rate_limit"]["requests_per_minute"],
@@ -154,9 +146,51 @@ concurrency_semaphore = asyncio.Semaphore(
 http_client: Optional[httpx.AsyncClient] = None
 
 
+def configure_runtime(
+    argv: Optional[Sequence[str]] = None,
+    environ: Optional[Mapping[str, str]] = None,
+    *,
+    require_secrets: bool = True,
+    from_cli: bool = False,
+) -> AppSettings:
+    """Resolve settings with strict precedence and apply them to runtime state."""
+    global runtime_settings, CONFIG_FILE, WWWROOT_DIR, config_data
+    global NVIDIA_API_KEY, concurrency_semaphore, _cli_configured
+
+    resolved = resolve_settings(
+        argv=argv,
+        environ=environ,
+        allow_yaml_fallback=True,
+        require_secrets=require_secrets,
+    )
+    runtime_settings = resolved
+    CONFIG_FILE = resolved.config_file
+    WWWROOT_DIR = resolved.wwwroot_dir
+    config_data = resolved.to_config_dict()
+    NVIDIA_API_KEY = resolved.nvidia_api_key
+    _cli_configured = from_cli
+
+    if not os.path.exists(CONFIG_FILE):
+        save_config(config_data, CONFIG_FILE)
+
+    token_bucket.update_params(
+        rpm=config_data["rate_limit"]["requests_per_minute"],
+        window_seconds=config_data["rate_limit"]["window_seconds"],
+        capacity=config_data["rate_limit"]["burst_capacity"],
+    )
+    concurrency_semaphore = asyncio.Semaphore(config_data["proxy"]["concurrency_limit"])
+    return resolved
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
+
+    # Re-resolve settings from env > dotenv > config.yaml > defaults (fail if required missing)
+    # unless already explicitly configured via CLI main().
+    if not _cli_configured:
+        configure_runtime(argv=[], require_secrets=True, from_cli=False)
+
     # Init DB schema
     db_path = config_data["db"]["path"]
     await database.init_db(db_path)
@@ -261,7 +295,7 @@ async def update_admin_config(new_config: Dict[str, Any]):
         if "db" in new_config:
             config_data["db"].update(new_config["db"])
 
-        save_config(config_data)
+        save_config(config_data, CONFIG_FILE)
 
         # Update in-memory structures
         token_bucket.update_params(
@@ -270,6 +304,8 @@ async def update_admin_config(new_config: Dict[str, Any]):
             capacity=config_data["rate_limit"]["burst_capacity"],
         )
         concurrency_semaphore = asyncio.Semaphore(config_data["proxy"]["concurrency_limit"])
+        if http_client is not None:
+            http_client.base_url = httpx.URL(config_data["proxy"]["upstream_url"])
 
         return {"status": "updated", "config": config_data}
     except Exception as e:
@@ -333,10 +369,9 @@ async def proxy_request(path: str, request: Request):
         # Never forward client's Authorization header
         headers.pop("authorization", None)
 
-        # Inject upstream NVIDIA credential
-        api_key = os.getenv("NVIDIA_API_KEY", NVIDIA_API_KEY)
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        # Inject upstream NVIDIA credential resolved via strict precedence
+        if NVIDIA_API_KEY:
+            headers["Authorization"] = f"Bearer {NVIDIA_API_KEY}"
 
         # Strip headers generated by client socket connection
         for hop_header in ("host", "content-length", "connection", "transfer-encoding"):
@@ -423,3 +458,19 @@ async def proxy_request(path: str, request: Request):
                 status_code=502,
                 content={"error": "Bad Gateway", "details": str(e)},
             )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    """CLI entrypoint supporting argparse > env > dotenv > config.yaml > default/fail."""
+    cli_args = sys.argv[1:] if argv is None else list(argv)
+    try:
+        resolved = configure_runtime(argv=cli_args, require_secrets=True, from_cli=True)
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    uvicorn.run(app, host=resolved.host, port=resolved.port)
+
+
+if __name__ == "__main__":
+    main()

@@ -13,6 +13,9 @@ services:
       UPSTREAM_URL: ${UPSTREAM_URL:-https://integrate.api.nvidia.com}
       DB_PATH: ${DB_PATH:-data/limiter.db}
       CONFIG_FILE: ${CONFIG_FILE:-data/config.yaml}
+      ENV_FILE: ${ENV_FILE:-.env}
+      ADMIN_TITLE: ${ADMIN_TITLE:-NVIDIA NIM Rate Limiter Dashboard}
+      WWWROOT_DIR: ${WWWROOT_DIR:-wwwroot}
 
     restart: unless-stopped
 

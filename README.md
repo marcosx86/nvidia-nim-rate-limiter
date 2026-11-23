@@ -40,9 +40,13 @@ Set your NVIDIA API Key in `.env`:
 NVIDIA_API_KEY=nvapi-YOUR_REAL_KEY_HERE
 ```
 
-Run the FastAPI application:
+Run the FastAPI application via the CLI entrypoint (supports `argparse` overrides) or directly with `uvicorn`:
 
 ```bash
+# CLI entrypoint (recommended — supports full argparse flags)
+python app.py --host 127.0.0.1 --port 8000
+
+# Or via uvicorn (uses env > .env > config.yaml > defaults)
 uvicorn app:app --host 127.0.0.1 --port 8000 --reload
 ```
 
@@ -64,19 +68,31 @@ curl http://127.0.0.1:8199/healthz
 
 ---
 
-## ⚙️ Configuration Reference (`config.yaml`)
+## ⚙️ Configuration Reference & Precedence
 
-Configuration can be specified in `config.yaml` or overridden via environment variables:
+Parameters are resolved strictly in the following precedence order:
 
-| Environment Variable | YAML Path | Default Value | Description |
-| :--- | :--- | :--- | :--- |
-| `NVIDIA_API_KEY` | - | *Required* | Raw NVIDIA NIM API key (`nvapi-...`) |
-| `RPM` | `rate_limit.requests_per_minute` | `6.0` | Allowed requests per minute |
-| `WINDOW_SECONDS` | `rate_limit.window_seconds` | `60.0` | Time window in seconds |
-| `BURST_CAPACITY` | `rate_limit.burst_capacity` | `6.0` | Max token bucket capacity |
-| `MAX_CONCURRENT` | `proxy.concurrency_limit` | `1` | Max simultaneous requests upstream |
-| `UPSTREAM_URL` | `proxy.upstream_url` | `https://integrate.api.nvidia.com` | Base URL of upstream NIM API |
-| `DB_PATH` | `db.path` | `limiter.db` | Path to SQLite database file |
+1. **CLI arguments (`argparse`)** — highest priority (e.g., `--rpm 12`)
+2. **Environment variables** (`os.environ`)
+3. **`.env` file (`dotenv`)** — loaded via `python-dotenv` without mutating `os.environ`
+4. **`config.yaml`** — persisted non-secret runtime settings (never stores `NVIDIA_API_KEY`)
+5. **Default value** — or **fail fast** on startup if a required parameter (`NVIDIA_API_KEY`) is missing
+
+| CLI Flag | Environment Variable | YAML Path | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `--nvidia-api-key` | `NVIDIA_API_KEY` | *(never persisted)* | **Required** | Raw NVIDIA NIM API key (`nvapi-...`); startup fails if missing |
+| `--rpm` | `RPM` | `rate_limit.requests_per_minute` | `6.0` | Allowed requests per window |
+| `--window-seconds` | `WINDOW_SECONDS` | `rate_limit.window_seconds` | `60.0` | Time window in seconds |
+| `--burst-capacity` | `BURST_CAPACITY` | `rate_limit.burst_capacity` | `6.0` | Max token bucket capacity |
+| `--max-concurrent` | `MAX_CONCURRENT` | `proxy.concurrency_limit` | `1` | Max simultaneous requests upstream |
+| `--upstream-url` | `UPSTREAM_URL` | `proxy.upstream_url` | `https://integrate.api.nvidia.com` | Base URL of upstream NIM API |
+| `--db-path` | `DB_PATH` | `db.path` | `limiter.db` | Path to SQLite database file |
+| `--admin-title` | `ADMIN_TITLE` | `admin.title` | `NVIDIA NIM Rate Limiter Dashboard` | Dashboard HTML `<title>` and header |
+| `--config-file` | `CONFIG_FILE` | - | `config.yaml` | Path to YAML configuration file |
+| `--env-file` | `ENV_FILE` | - | `.env` | Path to dotenv file |
+| `--wwwroot-dir` | `WWWROOT_DIR` | - | `wwwroot` | Directory containing dashboard static assets |
+| `--host` | `HOST` | - | `127.0.0.1` | Bind host when launched via `python app.py` |
+| `--port` | `PORT` | - | `8000` | Bind port when launched via `python app.py` |
 
 ---
 
