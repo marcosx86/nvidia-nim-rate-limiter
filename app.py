@@ -22,13 +22,16 @@ from rate_limiter import (
     TokenBucket,
     estimate_request_tokens,
 )
+from routing import ModelCatalogCache, ModelRouter, detect_deployment_mode
 from settings import (
     AppSettings,
     ConfigError,
     build_arg_parser,
     resolve_settings,
     validate_bind_guardrails,
+    validate_model_list,
     validate_model_rate_limits,
+    validate_model_routes,
 )
 
 
@@ -114,6 +117,8 @@ _cli_configured: bool = False
 rate_limit_manager = RateLimitManager.from_config(config_data)
 token_bucket: TokenBucket = rate_limit_manager.global_rpm
 concurrency_semaphore: asyncio.Semaphore = rate_limit_manager.global_semaphore
+model_router = ModelRouter.from_config(config_data, env_file=runtime_settings.env_file)
+catalog_cache = ModelCatalogCache(ttl_seconds=runtime_settings.catalog_cache_ttl)
 
 http_client: Optional[httpx.AsyncClient] = None
 
@@ -148,6 +153,9 @@ def configure_runtime(
     rate_limit_manager.configure_from_dict(config_data)
     token_bucket = rate_limit_manager.global_rpm
     concurrency_semaphore = rate_limit_manager.global_semaphore
+    model_router.configure_from_dict(config_data, env_file=resolved.env_file)
+    catalog_cache.clear()
+    catalog_cache.set_ttl(resolved.catalog_cache_ttl)
     return resolved
 
 
@@ -175,6 +183,7 @@ async def lifespan(app: FastAPI):
         ),
     )
     yield
+    await model_router.aclose_all()
     if http_client:
         await http_client.aclose()
 
@@ -199,12 +208,20 @@ async def healthz():
 
 @app.get("/status", tags=["System"])
 async def status():
+    proxy_cfg = config_data.get("proxy", {})
+    deployment_mode = detect_deployment_mode(
+        proxy_cfg.get("upstream_url", ""),
+        proxy_cfg.get("deployment_mode", "auto"),
+    )
     return {
         "status": "healthy",
+        "deployment_mode": deployment_mode,
         "rate_limiter": rate_limit_manager.status_snapshot(),
+        "governance": model_router.status_snapshot(),
+        "catalog": catalog_cache.snapshot(),
         "concurrency": {
-            "limit": config_data["proxy"]["concurrency_limit"],
-            "active_tasks": config_data["proxy"]["concurrency_limit"] - concurrency_semaphore._value,
+            "limit": proxy_cfg["concurrency_limit"],
+            "active_tasks": proxy_cfg["concurrency_limit"] - concurrency_semaphore._value,
         },
         "config": config_data,
     }
@@ -214,16 +231,27 @@ async def status():
 @app.get("/admin/metrics", tags=["Admin"])
 async def admin_metrics():
     db_path = config_data["db"]["path"]
+    proxy_cfg = config_data.get("proxy", {})
     metrics = await database.get_metrics(db_path)
     snapshot = rate_limit_manager.status_snapshot()
+    metrics["deployment_mode"] = detect_deployment_mode(
+        proxy_cfg.get("upstream_url", ""),
+        proxy_cfg.get("deployment_mode", "auto"),
+    )
     metrics["current_tokens"] = snapshot["tokens_available"]
     metrics["capacity"] = snapshot["capacity"]
     metrics["tpm_available"] = snapshot["tpm_available"]
     metrics["tpm_capacity"] = snapshot["tpm_capacity"]
     metrics["active_cooldowns"] = snapshot["active_cooldowns"]
     metrics["upstream_throttled_count"] = snapshot["upstream_throttled_count"]
-    metrics["active_concurrency"] = config_data["proxy"]["concurrency_limit"] - concurrency_semaphore._value
+    metrics["catalog"] = catalog_cache.snapshot()
+    metrics["active_concurrency"] = proxy_cfg["concurrency_limit"] - concurrency_semaphore._value
     return metrics
+
+
+@app.get("/admin/catalog", tags=["Admin"])
+async def admin_catalog():
+    return catalog_cache.snapshot()
 
 
 @app.get("/admin/logs", tags=["Admin"])
@@ -259,7 +287,23 @@ async def update_admin_config(new_config: Dict[str, Any]):
         if "admin" in new_config:
             config_data["admin"].update(new_config["admin"])
         if "proxy" in new_config:
-            config_data["proxy"].update(new_config["proxy"])
+            proxy_update = dict(new_config["proxy"])
+            if "deployment_mode" in proxy_update:
+                mode_val = str(proxy_update["deployment_mode"]).strip().lower()
+                if mode_val not in ("auto", "trial", "self_hosted", "partner"):
+                    raise ValueError("Invalid proxy.deployment_mode: must be auto, trial, self_hosted, or partner")
+                proxy_update["deployment_mode"] = mode_val
+            if "allowed_models" in proxy_update:
+                proxy_update["allowed_models"] = validate_model_list(
+                    proxy_update["allowed_models"], "allowed_models"
+                )
+            if "blocked_models" in proxy_update:
+                proxy_update["blocked_models"] = validate_model_list(
+                    proxy_update["blocked_models"], "blocked_models"
+                )
+            if "model_routes" in proxy_update:
+                proxy_update["model_routes"] = validate_model_routes(proxy_update["model_routes"])
+            config_data["proxy"].update(proxy_update)
         if "rate_limit" in new_config:
             rl_update = dict(new_config["rate_limit"])
             if "models" in rl_update:
@@ -274,6 +318,8 @@ async def update_admin_config(new_config: Dict[str, Any]):
         rate_limit_manager.configure_from_dict(config_data)
         token_bucket = rate_limit_manager.global_rpm
         concurrency_semaphore = rate_limit_manager.global_semaphore
+        model_router.configure_from_dict(config_data, env_file=runtime_settings.env_file)
+        catalog_cache.set_ttl(float(config_data["proxy"].get("catalog_cache_ttl", 300.0)))
         if http_client is not None:
             http_client.base_url = httpx.URL(config_data["proxy"]["upstream_url"])
 
@@ -327,6 +373,51 @@ async def proxy_request(path: str, request: Request):
                 model_name = parsed.get("model")
         except Exception:
             pass
+
+    # 0. Model Governance & Catalog Enforcement (before consuming rate-limit tokens)
+    policy_reason = model_router.check_model_policy(model_name)
+    if policy_reason is not None:
+        latency_ms = (time.time() - start_time) * 1000.0
+        await database.log_request(
+            db_path=db_path,
+            method=request.method,
+            path="/" + path,
+            status_code=403,
+            latency_ms=latency_ms,
+            request_bytes=len(body),
+            response_bytes=0,
+            allowed=False,
+            model=model_name,
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": "model_not_allowed",
+                "model": model_name,
+                "reason": policy_reason,
+            },
+        )
+
+    if config_data.get("proxy", {}).get("enforce_catalog") and catalog_cache.is_known(model_name) is False:
+        latency_ms = (time.time() - start_time) * 1000.0
+        await database.log_request(
+            db_path=db_path,
+            method=request.method,
+            path="/" + path,
+            status_code=404,
+            latency_ms=latency_ms,
+            request_bytes=len(body),
+            response_bytes=0,
+            allowed=False,
+            model=model_name,
+        )
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "model_not_in_catalog",
+                "model": model_name,
+            },
+        )
 
     # 1. Daily Quota Caps (UTC day)
     rate_cfg = config_data.get("rate_limit", {})
@@ -402,14 +493,22 @@ async def proxy_request(path: str, request: Request):
 
     # 3. Concurrency Control & Proxying
     async with rate_limit_manager.semaphore_context(model_name):
+        default_upstream = config_data["proxy"]["upstream_url"]
+        target = model_router.resolve_target(
+            model_name,
+            default_upstream=default_upstream,
+            default_api_key=NVIDIA_API_KEY,
+        )
+        target_client = model_router.get_client(target.base_url, http_client, default_upstream)
+
         headers = dict(request.headers)
 
         # Never forward client's Authorization header
         headers.pop("authorization", None)
 
-        # Inject upstream NVIDIA credential resolved via strict precedence
-        if NVIDIA_API_KEY:
-            headers["Authorization"] = f"Bearer {NVIDIA_API_KEY}"
+        # Inject upstream credential for the resolved route (omit if keyless local NIM)
+        if target.api_key:
+            headers["Authorization"] = f"Bearer {target.api_key}"
 
         # Strip headers generated by client socket connection
         for hop_header in ("host", "content-length", "connection", "transfer-encoding"):
@@ -419,18 +518,18 @@ async def proxy_request(path: str, request: Request):
         if request.url.query:
             upstream_path += "?" + request.url.query
 
-        if http_client is None:
+        if target_client is None:
             await rate_limit_manager.reconcile_tokens(reservation, None)
             raise HTTPException(status_code=500, detail="HTTP client not initialized")
 
         try:
-            req_builder = http_client.build_request(
+            req_builder = target_client.build_request(
                 method=request.method,
                 url=upstream_path,
                 headers=headers,
                 content=body,
             )
-            upstream_response = await http_client.send(req_builder, stream=True)
+            upstream_response = await target_client.send(req_builder, stream=True)
             rate_limit_manager.record_upstream_status(
                 upstream_response.status_code,
                 upstream_response.headers,
@@ -441,19 +540,34 @@ async def proxy_request(path: str, request: Request):
             for h in ("content-length", "transfer-encoding", "connection"):
                 response_headers.pop(h, None)
 
+            is_models_catalog_req = (
+                request.method == "GET"
+                and path.rstrip("/") == "v1/models"
+                and upstream_response.status_code == 200
+            )
+
             async def stream_generator():
                 bytes_count = 0
                 collected_chunks = []
+                catalog_chunks = [] if is_models_catalog_req else None
                 try:
                     async for chunk in upstream_response.aiter_bytes():
                         bytes_count += len(chunk)
-                        if len(collected_chunks) < 40 or b"usage" in chunk or b"prompt_tokens" in chunk:
+                        if catalog_chunks is not None:
+                            catalog_chunks.append(chunk)
+                        elif len(collected_chunks) < 40 or b"usage" in chunk or b"prompt_tokens" in chunk:
                             collected_chunks.append(chunk)
                         yield chunk
                 except (ClientDisconnect, asyncio.CancelledError):
                     pass
                 finally:
                     await upstream_response.aclose()
+                    if catalog_chunks is not None:
+                        try:
+                            catalog_payload = json.loads(b"".join(catalog_chunks).decode("utf-8"))
+                            catalog_cache.update_from_payload(catalog_payload)
+                        except Exception:
+                            pass
                     latency_ms = (time.time() - start_time) * 1000.0
                     response_text = b"".join(collected_chunks).decode("utf-8", errors="ignore")
                     prompt_tokens, completion_tokens, total_tokens = extract_tokens(response_text)

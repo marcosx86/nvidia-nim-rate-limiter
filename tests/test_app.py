@@ -18,6 +18,7 @@ from rate_limiter import (
     TPMBucket,
     parse_retry_after,
 )
+from routing import detect_deployment_mode
 from settings import ConfigError, is_loopback_host, resolve_settings, validate_bind_guardrails
 
 TEST_DB = "test_limiter.db"
@@ -46,12 +47,20 @@ def setup_test_env(tmp_path, monkeypatch):
     monkeypatch.delenv("DAILY_TOKEN_CAP", raising=False)
     monkeypatch.delenv("MAX_CONCURRENT", raising=False)
     monkeypatch.delenv("UPSTREAM_URL", raising=False)
+    monkeypatch.delenv("DEPLOYMENT_MODE", raising=False)
+    monkeypatch.delenv("CATALOG_CACHE_TTL", raising=False)
+    monkeypatch.delenv("ENFORCE_CATALOG", raising=False)
     monkeypatch.delenv("ADMIN_TITLE", raising=False)
     monkeypatch.delenv("HOST", raising=False)
     monkeypatch.delenv("PORT", raising=False)
     monkeypatch.delenv("ALLOW_NON_LOCAL_BIND", raising=False)
     monkeypatch.delenv("STRICT_TRIAL_GUARDRAILS", raising=False)
     monkeypatch.setattr(app_module, "_cli_configured", False)
+    app_module.rate_limit_manager.global_rpm.tokens = app_module.rate_limit_manager.global_rpm.capacity
+    app_module.rate_limit_manager._cooldown_until.clear()
+    app_module.rate_limit_manager._consecutive_429s.clear()
+    app_module.rate_limit_manager.upstream_throttled_count = 0
+    app_module.catalog_cache.clear()
 
     yield
 
@@ -787,3 +796,225 @@ def test_upstream_429_triggers_model_cooldown_and_backoff(monkeypatch):
         status_data = client.get("/status").json()
         assert status_data["rate_limiter"]["upstream_throttled_count"] == 1
         assert "deepseek-ai/deepseek-r1" in status_data["rate_limiter"]["active_cooldowns"]
+
+
+# --- Spec 03: Trial Guardrails, Model Governance & Upstream Graduation ---
+def test_deployment_mode_detection_and_trial_banner(monkeypatch):
+    assert detect_deployment_mode("https://integrate.api.nvidia.com") == "trial"
+    assert detect_deployment_mode("http://127.0.0.1:8001") == "self_hosted"
+    assert detect_deployment_mode("http://nim-local:8000") == "self_hosted"
+    assert detect_deployment_mode("https://api.together.xyz") == "partner"
+    assert detect_deployment_mode("https://integrate.api.nvidia.com", "self_hosted") == "self_hosted"
+
+    with TestClient(app) as client:
+        status_json = client.get("/status").json()
+        assert status_json["deployment_mode"] == "trial"
+        metrics_json = client.get("/admin/metrics").json()
+        assert metrics_json["deployment_mode"] == "trial"
+        html_resp = client.get("/admin/")
+        assert "trialBanner" in html_resp.text
+        assert "Trial / Prototyping Only" in html_resp.text
+
+    monkeypatch.setenv("UPSTREAM_URL", "http://nim-local:8000")
+    with TestClient(app) as client:
+        assert client.get("/status").json()["deployment_mode"] == "self_hosted"
+
+
+def test_model_routes_graduation_and_secret_rejection(monkeypatch, tmp_path):
+    bad_yaml = tmp_path / "bad_routes.yaml"
+    bad_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "proxy": {
+                    "model_routes": {
+                        "meta/llama-3.3-70b-instruct": {
+                            "upstream_url": "http://nim-local:8000",
+                            "api_key": "nvapi-should-be-rejected",
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="Forbidden raw credential"):
+        resolve_settings(
+            argv=["--nvidia-api-key", "nvapi-ok", "--config-file", str(bad_yaml)],
+            environ={},
+        )
+
+    good_yaml = tmp_path / "routes.yaml"
+    good_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "proxy": {
+                    "upstream_url": "https://integrate.api.nvidia.com",
+                    "model_routes": {
+                        "meta/llama-3.3-70b-instruct": {
+                            "upstream_url": "http://nim-local:8000",
+                            "api_key_env": "LOCAL_NIM_KEY",
+                        },
+                        "local/keyless-model": {
+                            "upstream_url": "http://nim-keyless:8001",
+                        },
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CONFIG_FILE", str(good_yaml))
+    monkeypatch.setenv("LOCAL_NIM_KEY", "local-secret-token")
+
+    seen_calls = []
+
+    def make_transport(tag: str) -> httpx.MockTransport:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen_calls.append(
+                (tag, str(request.url), request.headers.get("authorization"))
+            )
+            return httpx.Response(
+                200,
+                json={"id": tag, "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10}},
+            )
+
+        return httpx.MockTransport(handler)
+
+    with TestClient(app) as client:
+        app_module.http_client = httpx.AsyncClient(
+            base_url="https://integrate.api.nvidia.com",
+            transport=make_transport("default"),
+        )
+        app_module.model_router._route_clients["http://nim-local:8000"] = httpx.AsyncClient(
+            base_url="http://nim-local:8000",
+            transport=make_transport("graduated"),
+        )
+        app_module.model_router._route_clients["http://nim-keyless:8001"] = httpx.AsyncClient(
+            base_url="http://nim-keyless:8001",
+            transport=make_transport("keyless"),
+        )
+
+        # Unmatched model uses default upstream + NVIDIA_API_KEY
+        r_def = client.post("/v1/chat/completions", json={"model": "deepseek-ai/deepseek-r1"})
+        assert r_def.status_code == 200
+        # Graduated model uses nim-local + LOCAL_NIM_KEY
+        r_grad = client.post("/v1/chat/completions", json={"model": "meta/llama-3.3-70b-instruct"})
+        assert r_grad.status_code == 200
+        # Keyless local model strips/omits Authorization
+        r_keyless = client.post("/v1/chat/completions", json={"model": "local/keyless-model"})
+        assert r_keyless.status_code == 200
+
+        assert seen_calls[0] == (
+            "default",
+            "https://integrate.api.nvidia.com/v1/chat/completions",
+            "Bearer nvapi-test-default-key",
+        )
+        assert seen_calls[1] == (
+            "graduated",
+            "http://nim-local:8000/v1/chat/completions",
+            "Bearer local-secret-token",
+        )
+        assert seen_calls[2] == (
+            "keyless",
+            "http://nim-keyless:8001/v1/chat/completions",
+            None,
+        )
+
+
+def test_model_allowlist_and_denylist_403_preserves_tokens(monkeypatch):
+    monkeypatch.setenv("RPM", "60")
+    monkeypatch.setenv("BURST_CAPACITY", "5")
+
+    upstream_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(200, json={"id": "ok"})
+
+    with TestClient(app) as client:
+        app_module.http_client = httpx.AsyncClient(
+            base_url="https://mock.nvidia.test",
+            transport=httpx.MockTransport(handler),
+        )
+        client.post(
+            "/admin/config",
+            json={
+                "proxy": {
+                    "allowed_models": ["meta/llama-3.3-70b-instruct", "bad/blocked-model"],
+                    "blocked_models": ["bad/blocked-model"],
+                }
+            },
+        )
+        tokens_before = app_module.token_bucket.tokens
+
+        # Blocked model rejected with 403 without touching tokens or upstream
+        r_blocked = client.post("/v1/chat/completions", json={"model": "bad/blocked-model"})
+        assert r_blocked.status_code == 403
+        assert r_blocked.json()["reason"] == "model_blocked"
+        assert app_module.token_bucket.tokens == pytest.approx(tokens_before, abs=0.05)
+
+        # Unlisted model rejected with 403
+        r_unlisted = client.post("/v1/chat/completions", json={"model": "other/model"})
+        assert r_unlisted.status_code == 403
+        assert r_unlisted.json()["reason"] == "model_not_in_allowlist"
+        assert app_module.token_bucket.tokens == pytest.approx(tokens_before, abs=0.05)
+        assert upstream_calls == 0
+
+        # Allowed model succeeds and consumes 1 token
+        r_ok = client.post("/v1/chat/completions", json={"model": "meta/llama-3.3-70b-instruct"})
+        assert r_ok.status_code == 200
+        assert upstream_calls == 1
+        assert app_module.token_bucket.tokens < tokens_before
+
+        metrics = client.get("/admin/metrics").json()
+        assert metrics["throttled_requests"] >= 2
+
+
+def test_passive_catalog_cache_and_enforce_catalog_404(monkeypatch):
+    monkeypatch.setenv("RPM", "60")
+    monkeypatch.setenv("BURST_CAPACITY", "5")
+    monkeypatch.setenv("ENFORCE_CATALOG", "true")
+
+    upstream_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={"object": "list", "data": [{"id": "meta/llama-3.3-70b-instruct"}]},
+            )
+        return httpx.Response(200, json={"id": "ok"})
+
+    with TestClient(app) as client:
+        app_module.http_client = httpx.AsyncClient(
+            base_url="https://mock.nvidia.test",
+            transport=httpx.MockTransport(handler),
+        )
+
+        # Cold cache does not block before /v1/models is fetched
+        assert client.get("/admin/catalog").json()["cached_count"] == 0
+
+        # GET /v1/models passively populates catalog cache
+        r_models = client.get("/v1/models")
+        assert r_models.status_code == 200
+        catalog = client.get("/admin/catalog").json()
+        assert catalog["active"] is True
+        assert catalog["models"] == ["meta/llama-3.3-70b-instruct"]
+
+        tokens_before = app_module.token_bucket.tokens
+        calls_before = upstream_calls
+
+        # Unknown model fails fast with 404 without consuming tokens or hitting upstream
+        r_missing = client.post("/v1/chat/completions", json={"model": "retired/model-v0"})
+        assert r_missing.status_code == 404
+        assert r_missing.json()["error"] == "model_not_in_catalog"
+        assert app_module.token_bucket.tokens == pytest.approx(tokens_before, abs=0.05)
+        assert upstream_calls == calls_before
+
+        # Known catalog model proceeds normally
+        r_known = client.post("/v1/chat/completions", json={"model": "meta/llama-3.3-70b-instruct"})
+        assert r_known.status_code == 200
+        assert upstream_calls == calls_before + 1

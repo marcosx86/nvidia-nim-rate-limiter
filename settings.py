@@ -2,7 +2,7 @@ import argparse
 import ipaddress
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 from dotenv import dotenv_values
@@ -73,6 +73,13 @@ def _parse_bool(value: Any) -> bool:
     raise ValueError("must be a boolean (true/false, 1/0, yes/no, on/off)")
 
 
+def _parse_deployment_mode(value: Any) -> str:
+    text = str(value).strip().lower()
+    if text in ("auto", "trial", "self_hosted", "partner"):
+        return text
+    raise ValueError("must be one of: auto, trial, self_hosted, partner")
+
+
 @dataclass(frozen=True)
 class ParamSpec:
     name: str
@@ -127,6 +134,36 @@ PARAM_SPECS: Tuple[ParamSpec, ...] = (
         yaml_section="proxy",
         yaml_key="upstream_url",
         help="Base URL of upstream NVIDIA NIM API (default: https://integrate.api.nvidia.com).",
+    ),
+    ParamSpec(
+        name="deployment_mode",
+        cli_flag="--deployment-mode",
+        env_var="DEPLOYMENT_MODE",
+        parser=_parse_deployment_mode,
+        default="auto",
+        yaml_section="proxy",
+        yaml_key="deployment_mode",
+        help="Deployment mode: auto, trial, self_hosted, or partner (default: auto).",
+    ),
+    ParamSpec(
+        name="catalog_cache_ttl",
+        cli_flag="--catalog-cache-ttl",
+        env_var="CATALOG_CACHE_TTL",
+        parser=_parse_non_negative_float,
+        default=300.0,
+        yaml_section="proxy",
+        yaml_key="catalog_cache_ttl",
+        help="Seconds to cache /v1/models catalog responses; 0 disables (default: 300.0).",
+    ),
+    ParamSpec(
+        name="enforce_catalog",
+        cli_flag="--enforce-catalog",
+        env_var="ENFORCE_CATALOG",
+        parser=_parse_bool,
+        default=False,
+        yaml_section="proxy",
+        yaml_key="enforce_catalog",
+        help="Reject requests with 404 when model is absent from cached /v1/models catalog (default: false).",
     ),
     ParamSpec(
         name="concurrency_limit",
@@ -279,6 +316,9 @@ class AppSettings:
     config_file: str
     nvidia_api_key: str
     upstream_url: str
+    deployment_mode: str
+    catalog_cache_ttl: float
+    enforce_catalog: bool
     concurrency_limit: int
     requests_per_minute: float
     window_seconds: float
@@ -295,6 +335,9 @@ class AppSettings:
     allow_non_local_bind: bool = False
     strict_trial_guardrails: bool = False
     model_rate_limits: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    allowed_models: List[str] = field(default_factory=list)
+    blocked_models: List[str] = field(default_factory=list)
+    model_routes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     sources: Dict[str, str] = field(default_factory=dict)
 
     def to_config_dict(self) -> Dict[str, Any]:
@@ -302,7 +345,13 @@ class AppSettings:
         return {
             "proxy": {
                 "upstream_url": self.upstream_url,
+                "deployment_mode": self.deployment_mode,
+                "catalog_cache_ttl": self.catalog_cache_ttl,
+                "enforce_catalog": self.enforce_catalog,
                 "concurrency_limit": self.concurrency_limit,
+                "allowed_models": list(self.allowed_models),
+                "blocked_models": list(self.blocked_models),
+                "model_routes": {k: dict(v) for k, v in self.model_routes.items()},
             },
             "rate_limit": {
                 "requests_per_minute": self.requests_per_minute,
@@ -449,6 +498,80 @@ def validate_model_rate_limits(raw_models: Any) -> Dict[str, Dict[str, Any]]:
     return validated
 
 
+def validate_model_list(raw_list: Any, field_name: str) -> List[str]:
+    """Validate allowed_models / blocked_models string lists."""
+    if raw_list is None:
+        return []
+    if not isinstance(raw_list, list):
+        raise ConfigError(f"Invalid 'proxy.{field_name}': must be a list of model names.")
+    cleaned: List[str] = []
+    for item in raw_list:
+        val = str(item).strip()
+        if not val:
+            raise ConfigError(f"Invalid 'proxy.{field_name}' entry: must be a non-empty string.")
+        if val not in cleaned:
+            cleaned.append(val)
+    return cleaned
+
+
+def validate_model_routes(raw_routes: Any) -> Dict[str, Dict[str, Any]]:
+    """Validate proxy.model_routes while strictly forbidding raw secrets in YAML."""
+    if raw_routes is None:
+        return {}
+    if not isinstance(raw_routes, Mapping):
+        raise ConfigError("Invalid 'proxy.model_routes': must be a mapping of model_id -> route.")
+
+    validated: Dict[str, Dict[str, Any]] = {}
+    for model_name, route_cfg in raw_routes.items():
+        model_id = str(model_name).strip()
+        if not model_id:
+            raise ConfigError("Invalid 'proxy.model_routes' key: model name must be non-empty.")
+        if not isinstance(route_cfg, Mapping):
+            raise ConfigError(f"Invalid 'proxy.model_routes.{model_id}': must be a mapping.")
+
+        for forbidden_key in ("api_key", "nvidia_api_key", "token", "secret", "authorization"):
+            if forbidden_key in route_cfg:
+                raise ConfigError(
+                    f"Forbidden raw credential key '{forbidden_key}' in 'proxy.model_routes.{model_id}'. "
+                    "Use 'api_key_env' to reference an environment variable instead."
+                )
+
+        upstream_url = str(route_cfg.get("upstream_url") or "").strip()
+        if not upstream_url or not (
+            upstream_url.startswith("http://") or upstream_url.startswith("https://")
+        ):
+            raise ConfigError(
+                f"Invalid 'proxy.model_routes.{model_id}.upstream_url': must be an http(s) URL."
+            )
+
+        cleaned: Dict[str, Any] = {"upstream_url": upstream_url.rstrip("/")}
+
+        if "api_key_env" in route_cfg and route_cfg["api_key_env"] is not None:
+            env_name = str(route_cfg["api_key_env"]).strip()
+            if not env_name or env_name.startswith("nvapi-"):
+                raise ConfigError(
+                    f"Invalid 'proxy.model_routes.{model_id}.api_key_env': must be an env var name, not a raw key."
+                )
+            cleaned["api_key_env"] = env_name
+
+        if "strip_auth" in route_cfg and route_cfg["strip_auth"] is not None:
+            try:
+                cleaned["strip_auth"] = _parse_bool(route_cfg["strip_auth"])
+            except Exception as exc:
+                raise ConfigError(
+                    f"Invalid 'proxy.model_routes.{model_id}.strip_auth': {exc}"
+                ) from exc
+
+        for extra_key in route_cfg:
+            if extra_key not in ("upstream_url", "api_key_env", "strip_auth"):
+                raise ConfigError(
+                    f"Unsupported key '{extra_key}' in 'proxy.model_routes.{model_id}'."
+                )
+
+        validated[model_id] = cleaned
+    return validated
+
+
 def _load_yaml_file(path: str) -> Dict[str, Any]:
     if not path or not os.path.exists(path):
         return {}
@@ -533,7 +656,22 @@ def resolve_settings(
     model_rate_limits = validate_model_rate_limits(raw_models)
     sources["model_rate_limits"] = "config.yaml" if model_rate_limits else "default"
 
-    return AppSettings(model_rate_limits=model_rate_limits, sources=sources, **resolved)
+    proxy_yaml = yaml_config.get("proxy") if isinstance(yaml_config.get("proxy"), Mapping) else {}
+    allowed_models = validate_model_list(proxy_yaml.get("allowed_models"), "allowed_models")
+    blocked_models = validate_model_list(proxy_yaml.get("blocked_models"), "blocked_models")
+    model_routes = validate_model_routes(proxy_yaml.get("model_routes"))
+    sources["allowed_models"] = "config.yaml" if allowed_models else "default"
+    sources["blocked_models"] = "config.yaml" if blocked_models else "default"
+    sources["model_routes"] = "config.yaml" if model_routes else "default"
+
+    return AppSettings(
+        model_rate_limits=model_rate_limits,
+        allowed_models=allowed_models,
+        blocked_models=blocked_models,
+        model_routes=model_routes,
+        sources=sources,
+        **resolved,
+    )
 
 
 def is_loopback_host(host: str) -> bool:

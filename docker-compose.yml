@@ -15,6 +15,9 @@ services:
       DAILY_TOKEN_CAP: ${DAILY_TOKEN_CAP:-0}
       MAX_CONCURRENT: ${MAX_CONCURRENT:-2}
       UPSTREAM_URL: ${UPSTREAM_URL:-https://integrate.api.nvidia.com}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-auto}
+      CATALOG_CACHE_TTL: ${CATALOG_CACHE_TTL:-300.0}
+      ENFORCE_CATALOG: ${ENFORCE_CATALOG:-false}
       DB_PATH: ${DB_PATH:-data/limiter.db}
       CONFIG_FILE: ${CONFIG_FILE:-data/config.yaml}
       ENV_FILE: ${ENV_FILE:-.env}

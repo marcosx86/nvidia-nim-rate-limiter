@@ -50,6 +50,22 @@
             font-size: 0.8rem;
             border: 1px solid rgba(118, 185, 0, 0.4);
         }
+        .trial-banner {
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            background: rgba(210, 153, 34, 0.12);
+            border: 1px solid rgba(210, 153, 34, 0.45);
+            color: #f0c45c;
+            padding: 10px 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 0.86rem;
+        }
+        .trial-banner strong {
+            color: #ffd97d;
+        }
         .grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -296,6 +312,11 @@
             <span id="headerTitle">{{ ADMIN_TITLE }}</span>
         </h1>
         <span class="badge" id="statusBadge">Active</span>
+    </div>
+
+    <div class="trial-banner" id="trialBanner">
+        <span><strong>Trial / Prototyping Only — Not for Production (NVIDIA Build API)</strong></span>
+        <span style="color: var(--text-muted); font-size: 0.8rem;">Graduate models via <code>proxy.model_routes</code> to self-hosted NIM or partner endpoints for production traffic.</span>
     </div>
 
     <div class="grid">
@@ -623,6 +644,11 @@
 
                 document.getElementById('valAvgLatency').innerText = metrics.avg_latency_ms ? Math.round(metrics.avg_latency_ms) + ' ms' : '0 ms';
                 document.getElementById('valConcurrency').innerText = metrics.active_concurrency ?? 0;
+
+                const trialBanner = document.getElementById('trialBanner');
+                if (trialBanner) {
+                    trialBanner.style.display = metrics.deployment_mode === 'trial' ? 'flex' : 'none';
+                }
 
                 // Update recent models filters
                 const models = logsData.recent_models || metrics.recent_models || [];

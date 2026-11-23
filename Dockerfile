@@ -9,7 +9,7 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py database.py settings.py rate_limiter.py config.yaml ./
+COPY app.py database.py settings.py rate_limiter.py routing.py config.yaml ./
 COPY wwwroot/ ./wwwroot/
 
 # Create data directory with appropriate write permissions

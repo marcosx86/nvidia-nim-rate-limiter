@@ -6,6 +6,7 @@ This repository is an asynchronous FastAPI reverse proxy, token-bucket rate limi
 
 - **`app.py`**: FastAPI application, upstream `httpx.AsyncClient` streaming proxy, `extract_tokens` SSE/JSON usage parser, CLI `main()` entrypoint, and `/healthz`, `/status`, `/admin/*` endpoints.
 - **`rate_limiter.py`**: Global and per-model `TokenBucket` (RPM), `TPMBucket` (Tokens-Per-Minute), concurrency semaphores, adaptive `429`/`Retry-After` cooldowns, and `--max-wait-seconds` enforcement.
+- **`routing.py`**: Trial/self-hosted/partner deployment mode detection, per-model upstream graduation routing, allowlist/denylist governance, and passive `/v1/models` catalog caching.
 - **`settings.py`**: Declarative parameter specs, `argparse` CLI parser, bind guardrails, and strict configuration precedence resolver (`argparse > environment var > dotenv > config.yaml > default or fail if required`).
 - **`database.py`**: Async SQLite (`aiosqlite`) persistence layer for `request_logs`, schema initialization/migrations, and aggregated metrics/log queries.
 - **`wwwroot/index.html`**: Static dark-mode Web Admin Dashboard served at `/admin/` with dynamic `admin.title` injection and interactive config/metrics/log filtering.

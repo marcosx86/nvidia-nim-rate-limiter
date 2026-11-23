@@ -94,6 +94,9 @@ Parameters are resolved strictly in the following precedence order:
 | `--daily-token-cap` | `DAILY_TOKEN_CAP` | `rate_limit.daily_token_cap` | `0` | UTC daily LLM token cap (`0` disables) |
 | `--max-concurrent` | `MAX_CONCURRENT` | `proxy.concurrency_limit` | `1` | Max simultaneous requests upstream |
 | `--upstream-url` | `UPSTREAM_URL` | `proxy.upstream_url` | `https://integrate.api.nvidia.com` | Base URL of upstream NIM API |
+| `--deployment-mode` | `DEPLOYMENT_MODE` | `proxy.deployment_mode` | `auto` | Deployment mode (`auto`, `trial`, `self_hosted`, `partner`) |
+| `--catalog-cache-ttl` | `CATALOG_CACHE_TTL` | `proxy.catalog_cache_ttl` | `300.0` | Seconds to cache `/v1/models` catalog (`0` disables) |
+| `--enforce-catalog` | `ENFORCE_CATALOG` | `proxy.enforce_catalog` | `false` | Return `404` for models missing from cached `/v1/models` catalog |
 | `--db-path` | `DB_PATH` | `db.path` | `limiter.db` | Path to SQLite database file |
 | `--admin-title` | `ADMIN_TITLE` | `admin.title` | `NVIDIA NIM Rate Limiter Dashboard` | Dashboard HTML `<title>` and header |
 | `--config-file` | `CONFIG_FILE` | - | `config.yaml` | Path to YAML configuration file |
@@ -116,7 +119,23 @@ Parameters are resolved strictly in the following precedence order:
 | `/admin/` | `GET` | Web Dashboard interface |
 | `/admin/metrics` | `GET` | Aggregated usage metrics JSON (RPM, avg latency, status codes) |
 | `/admin/logs` | `GET` | Queryable request history (`limit`, `offset`, `status_code`, `path`) |
+| `/admin/catalog` | `GET` | Inspect passively cached `/v1/models` catalog state |
 | `/admin/config` | `GET / POST` | Inspect or update proxy and rate limit configuration dynamically |
+
+### Example: Graduating a Model to Self-Hosted NIM (`config.yaml`)
+
+```yaml
+proxy:
+  upstream_url: https://integrate.api.nvidia.com
+  deployment_mode: auto
+  blocked_models:
+    - deprecated/old-model
+  model_routes:
+    meta/llama-3.3-70b-instruct:
+      upstream_url: http://nim-local:8000
+      # Optional: reference an env var name (never put raw keys in YAML)
+      # api_key_env: LOCAL_NIM_API_KEY
+```
 
 ---
 
