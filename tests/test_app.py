@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 import app as app_module
 import database
 from app import TokenBucket, app, extract_tokens
-from settings import ConfigError, resolve_settings
+from settings import ConfigError, is_loopback_host, resolve_settings, validate_bind_guardrails
 
 TEST_DB = "test_limiter.db"
 
@@ -408,9 +408,10 @@ def test_lifespan_fails_fast_without_nvidia_api_key(monkeypatch, tmp_path):
 def test_cli_main_applies_argparse_and_handles_missing_required(monkeypatch, tmp_path):
     called = {}
 
-    def fake_run(target_app, host, port):
+    def fake_run(target_app, host, port, workers=1):
         called["host"] = host
         called["port"] = port
+        called["workers"] = workers
 
     monkeypatch.setattr(app_module.uvicorn, "run", fake_run)
     cfg_path = tmp_path / "cli_config.yaml"
@@ -435,7 +436,7 @@ def test_cli_main_applies_argparse_and_handles_missing_required(monkeypatch, tmp
         ]
     )
 
-    assert called == {"host": "127.0.0.1", "port": 8123}
+    assert called == {"host": "127.0.0.1", "port": 8123, "workers": 1}
     assert app_module.NVIDIA_API_KEY == "nvapi-cli-key"
     assert app_module.config_data["rate_limit"]["requests_per_minute"] == 25.0
     assert app_module.config_data["proxy"]["concurrency_limit"] == 4
@@ -447,4 +448,92 @@ def test_cli_main_applies_argparse_and_handles_missing_required(monkeypatch, tmp
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
     with pytest.raises(SystemExit) as exc_info:
         app_module.main(["--config-file", str(cfg_path), "--db-path", str(db_path)])
+    assert exc_info.value.code == 2
+
+
+def test_bind_guardrails_and_bool_precedence(monkeypatch, tmp_path, capsys):
+    assert is_loopback_host("127.0.0.1") is True
+    assert is_loopback_host("localhost") is True
+    assert is_loopback_host("::1") is True
+    assert is_loopback_host("0.0.0.0") is False
+    assert is_loopback_host("192.168.1.10") is False
+
+    # Loopback host produces no warning
+    s_local = resolve_settings(
+        argv=["--nvidia-api-key", "nvapi-ok", "--host", "127.0.0.1"],
+        environ={},
+        allow_yaml_fallback=False,
+    )
+    assert validate_bind_guardrails(s_local) is None
+
+    # Non-loopback without strict mode returns warning
+    s_warn = resolve_settings(
+        argv=["--nvidia-api-key", "nvapi-ok", "--host", "0.0.0.0"],
+        environ={},
+        allow_yaml_fallback=False,
+    )
+    warning = validate_bind_guardrails(s_warn)
+    assert warning is not None
+    assert "0.0.0.0" in warning
+
+    # Non-loopback with strict mode fails unless --allow-non-local-bind true
+    s_strict = resolve_settings(
+        argv=["--nvidia-api-key", "nvapi-ok", "--host", "0.0.0.0", "--strict-trial-guardrails", "true"],
+        environ={},
+        allow_yaml_fallback=False,
+    )
+    with pytest.raises(ConfigError, match="non-loopback"):
+        validate_bind_guardrails(s_strict)
+
+    s_allowed = resolve_settings(
+        argv=[
+            "--nvidia-api-key",
+            "nvapi-ok",
+            "--host",
+            "0.0.0.0",
+            "--strict-trial-guardrails",
+            "true",
+            "--allow-non-local-bind",
+            "true",
+        ],
+        environ={},
+        allow_yaml_fallback=False,
+    )
+    assert validate_bind_guardrails(s_allowed) is None
+
+    # CLI main() prints warning on non-strict non-local bind and exits 2 on strict non-local bind
+    monkeypatch.setattr(app_module.uvicorn, "run", lambda *a, **kw: None)
+    cfg_path = tmp_path / "guard.yaml"
+    db_path = tmp_path / "guard.db"
+
+    app_module.main(
+        [
+            "--nvidia-api-key",
+            "nvapi-ok",
+            "--host",
+            "0.0.0.0",
+            "--config-file",
+            str(cfg_path),
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert "Security warning" in captured.err
+
+    with pytest.raises(SystemExit) as exc_info:
+        app_module.main(
+            [
+                "--nvidia-api-key",
+                "nvapi-ok",
+                "--host",
+                "0.0.0.0",
+                "--strict-trial-guardrails",
+                "true",
+                "--config-file",
+                str(cfg_path),
+                "--db-path",
+                str(db_path),
+            ]
+        )
     assert exc_info.value.code == 2

@@ -1,4 +1,5 @@
 import argparse
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
@@ -45,6 +46,17 @@ def _parse_port(value: Any) -> int:
     if not (1 <= parsed <= 65535):
         raise ValueError("must be between 1 and 65535")
     return parsed
+
+
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    raise ValueError("must be a boolean (true/false, 1/0, yes/no, on/off)")
 
 
 @dataclass(frozen=True)
@@ -186,6 +198,22 @@ PARAM_SPECS: Tuple[ParamSpec, ...] = (
         default=8000,
         help="Bind port when launched via CLI (default: 8000).",
     ),
+    ParamSpec(
+        name="allow_non_local_bind",
+        cli_flag="--allow-non-local-bind",
+        env_var="ALLOW_NON_LOCAL_BIND",
+        parser=_parse_bool,
+        default=False,
+        help="Allow binding to non-loopback addresses such as 0.0.0.0 (default: false).",
+    ),
+    ParamSpec(
+        name="strict_trial_guardrails",
+        cli_flag="--strict-trial-guardrails",
+        env_var="STRICT_TRIAL_GUARDRAILS",
+        parser=_parse_bool,
+        default=False,
+        help="Fail fast on unsafe trial/bind configurations instead of warning (default: false).",
+    ),
 )
 
 ALL_SPECS: Tuple[ParamSpec, ...] = (ENV_FILE_SPEC, CONFIG_FILE_SPEC, *PARAM_SPECS)
@@ -206,6 +234,8 @@ class AppSettings:
     wwwroot_dir: str
     host: str
     port: int
+    allow_non_local_bind: bool = False
+    strict_trial_guardrails: bool = False
     sources: Dict[str, str] = field(default_factory=dict)
 
     def to_config_dict(self) -> Dict[str, Any]:
@@ -395,3 +425,28 @@ def resolve_settings(
         sources[spec.name] = source
 
     return AppSettings(sources=sources, **resolved)
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return True if host refers to a loopback address (localhost, 127.x, ::1)."""
+    normalized = host.strip().lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_bind_guardrails(settings: AppSettings) -> Optional[str]:
+    """Check non-loopback bind safety. Raises ConfigError in strict mode, else returns a warning."""
+    if is_loopback_host(settings.host) or settings.allow_non_local_bind:
+        return None
+    msg = (
+        f"Security warning: binding proxy to non-loopback host '{settings.host}' "
+        "exposes an unauthenticated NVIDIA_API_KEY injector on the network. "
+        "Bind to 127.0.0.1 or pass --allow-non-local-bind true (ALLOW_NON_LOCAL_BIND=true)."
+    )
+    if settings.strict_trial_guardrails:
+        raise ConfigError(msg)
+    return msg

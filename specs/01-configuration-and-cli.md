@@ -3,7 +3,6 @@
 ## 1. Status
 
 - **Implemented:** `settings.py`, `app.py` (`configure_runtime`, `main`, `lifespan`), `Dockerfile`, `docker-compose.yml`
-- **Planned:** `--allow-non-local-bind` safety check
 
 ---
 
@@ -27,10 +26,13 @@ Every runtime parameter MUST resolve strictly in this order:
 
 ## 3. Bind & Worker Guardrails
 
-- **Single Worker:** Container and CLI execution MUST use 1 worker (`uvicorn.run(app, ...)` / `--workers 1`) because rate-limit and concurrency state live in process memory.
+- **Single Worker:** Container and CLI execution MUST use 1 worker (`uvicorn.run(app, ..., workers=1)` / `--workers 1`) because rate-limit and concurrency state live in process memory.
 - **Loopback Default:** `--host` defaults to `127.0.0.1` so `iron-proxy` or local clients connect over loopback without exposing an unauthenticated `NVIDIA_API_KEY` injector on the LAN.
-- **Planned (`--allow-non-local-bind` / `ALLOW_NON_LOCAL_BIND`):**
-  - When `--host` is non-loopback (e.g., `0.0.0.0`) and no local client auth token is configured, startup logs a prominent security warning (or fails if `--strict-trial-guardrails` is enabled) unless `--allow-non-local-bind=true` is explicitly set.
+- **Non-Local Bind Guardrail (`--allow-non-local-bind` / `ALLOW_NON_LOCAL_BIND`, `--strict-trial-guardrails` / `STRICT_TRIAL_GUARDRAILS`):**
+  - When `--host` is non-loopback (anything other than `localhost` or a loopback IP such as `127.0.0.1` / `::1`) and `--allow-non-local-bind` is `false` (default):
+    - If `--strict-trial-guardrails` is `true`, startup fails fast (`ConfigError` / exit code `2`).
+    - Otherwise, startup logs a prominent security warning to `stderr` reminding operators to bind to `127.0.0.1` or explicitly set `--allow-non-local-bind true`.
+  - Container deployments that intentionally bind `0.0.0.0` behind Docker port mapping pass `--allow-non-local-bind true`.
 
 ---
 

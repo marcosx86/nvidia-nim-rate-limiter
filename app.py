@@ -15,7 +15,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
 import database
-from settings import AppSettings, ConfigError, build_arg_parser, resolve_settings
+from settings import (
+    AppSettings,
+    ConfigError,
+    build_arg_parser,
+    resolve_settings,
+    validate_bind_guardrails,
+)
 
 
 def extract_tokens(text: str) -> Tuple[int, int, int]:
@@ -465,11 +471,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     cli_args = sys.argv[1:] if argv is None else list(argv)
     try:
         resolved = configure_runtime(argv=cli_args, require_secrets=True, from_cli=True)
+        warning = validate_bind_guardrails(resolved)
+        if warning:
+            print(warning, file=sys.stderr)
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
-    uvicorn.run(app, host=resolved.host, port=resolved.port)
+    uvicorn.run(app, host=resolved.host, port=resolved.port, workers=1)
 
 
 if __name__ == "__main__":

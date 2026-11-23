@@ -93,6 +93,8 @@ Parameters are resolved strictly in the following precedence order:
 | `--wwwroot-dir` | `WWWROOT_DIR` | - | `wwwroot` | Directory containing dashboard static assets |
 | `--host` | `HOST` | - | `127.0.0.1` | Bind host when launched via `python app.py` |
 | `--port` | `PORT` | - | `8000` | Bind port when launched via `python app.py` |
+| `--allow-non-local-bind` | `ALLOW_NON_LOCAL_BIND` | - | `false` | Allow binding to non-loopback hosts (e.g., `0.0.0.0`) |
+| `--strict-trial-guardrails` | `STRICT_TRIAL_GUARDRAILS` | - | `false` | Fail fast instead of warning on unsafe bind configurations |
 
 ---
 
