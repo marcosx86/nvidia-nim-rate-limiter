@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import time
 from typing import Any, Dict, List, Optional
 import aiosqlite
@@ -224,3 +225,32 @@ async def get_logs(
         async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+
+async def get_daily_usage(db_path: str, now: Optional[float] = None) -> Dict[str, Any]:
+    """Return allowed request count, total tokens, and seconds until UTC midnight reset."""
+    current_ts = time.time() if now is None else float(now)
+    utc_now = datetime.datetime.fromtimestamp(current_ts, tz=datetime.timezone.utc)
+    day_start = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_day = day_start + datetime.timedelta(days=1)
+    seconds_until_reset = max(1.0, next_day.timestamp() - current_ts)
+
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT
+                COUNT(*) as requests,
+                COALESCE(SUM(total_tokens), 0) as tokens
+            FROM request_logs
+            WHERE allowed = 1 AND timestamp >= ?
+            """,
+            (day_start.timestamp(),),
+        ) as cursor:
+            row = dict(await cursor.fetchone() or {})
+
+    return {
+        "requests": int(row.get("requests") or 0),
+        "tokens": int(row.get("tokens") or 0),
+        "seconds_until_reset": seconds_until_reset,
+    }

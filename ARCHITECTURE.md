@@ -4,8 +4,9 @@ This repository is an asynchronous FastAPI reverse proxy, token-bucket rate limi
 
 ## Core Components
 
-- **`app.py`**: FastAPI application, `TokenBucket` rate limiter, concurrency semaphore, upstream `httpx.AsyncClient` streaming proxy, `extract_tokens` SSE/JSON usage parser, CLI `main()` entrypoint, and `/healthz`, `/status`, `/admin/*` endpoints.
-- **`settings.py`**: Declarative parameter specs, `argparse` CLI parser, and strict configuration precedence resolver (`argparse > environment var > dotenv > config.yaml > default or fail if required`).
+- **`app.py`**: FastAPI application, upstream `httpx.AsyncClient` streaming proxy, `extract_tokens` SSE/JSON usage parser, CLI `main()` entrypoint, and `/healthz`, `/status`, `/admin/*` endpoints.
+- **`rate_limiter.py`**: Global and per-model `TokenBucket` (RPM), `TPMBucket` (Tokens-Per-Minute), concurrency semaphores, adaptive `429`/`Retry-After` cooldowns, and `--max-wait-seconds` enforcement.
+- **`settings.py`**: Declarative parameter specs, `argparse` CLI parser, bind guardrails, and strict configuration precedence resolver (`argparse > environment var > dotenv > config.yaml > default or fail if required`).
 - **`database.py`**: Async SQLite (`aiosqlite`) persistence layer for `request_logs`, schema initialization/migrations, and aggregated metrics/log queries.
 - **`wwwroot/index.html`**: Static dark-mode Web Admin Dashboard served at `/admin/` with dynamic `admin.title` injection and interactive config/metrics/log filtering.
 - **`config.yaml`**: Persisted runtime configuration (`proxy`, `rate_limit`, `db`, `admin`).

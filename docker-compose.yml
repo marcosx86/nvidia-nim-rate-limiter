@@ -9,6 +9,10 @@ services:
       RPM: ${RPM:-10.0}
       WINDOW_SECONDS: ${WINDOW_SECONDS:-60.0}
       BURST_CAPACITY: ${BURST_CAPACITY:-10.0}
+      TPM: ${TPM:-0}
+      MAX_WAIT_SECONDS: ${MAX_WAIT_SECONDS:-0.0}
+      DAILY_REQUEST_CAP: ${DAILY_REQUEST_CAP:-0}
+      DAILY_TOKEN_CAP: ${DAILY_TOKEN_CAP:-0}
       MAX_CONCURRENT: ${MAX_CONCURRENT:-2}
       UPSTREAM_URL: ${UPSTREAM_URL:-https://integrate.api.nvidia.com}
       DB_PATH: ${DB_PATH:-data/limiter.db}

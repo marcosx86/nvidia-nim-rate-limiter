@@ -1,11 +1,23 @@
+import email.utils
+import json
 import os
+import time
+
+import httpx
 import pytest
 import yaml
+from dotenv import dotenv_values
 from fastapi.testclient import TestClient
 
 import app as app_module
 import database
 from app import TokenBucket, app, extract_tokens
+from rate_limiter import (
+    RateLimitExceeded,
+    RateLimitManager,
+    TPMBucket,
+    parse_retry_after,
+)
 from settings import ConfigError, is_loopback_host, resolve_settings, validate_bind_guardrails
 
 TEST_DB = "test_limiter.db"
@@ -28,11 +40,17 @@ def setup_test_env(tmp_path, monkeypatch):
     monkeypatch.delenv("RPM", raising=False)
     monkeypatch.delenv("WINDOW_SECONDS", raising=False)
     monkeypatch.delenv("BURST_CAPACITY", raising=False)
+    monkeypatch.delenv("TPM", raising=False)
+    monkeypatch.delenv("MAX_WAIT_SECONDS", raising=False)
+    monkeypatch.delenv("DAILY_REQUEST_CAP", raising=False)
+    monkeypatch.delenv("DAILY_TOKEN_CAP", raising=False)
     monkeypatch.delenv("MAX_CONCURRENT", raising=False)
     monkeypatch.delenv("UPSTREAM_URL", raising=False)
     monkeypatch.delenv("ADMIN_TITLE", raising=False)
     monkeypatch.delenv("HOST", raising=False)
     monkeypatch.delenv("PORT", raising=False)
+    monkeypatch.delenv("ALLOW_NON_LOCAL_BIND", raising=False)
+    monkeypatch.delenv("STRICT_TRIAL_GUARDRAILS", raising=False)
     monkeypatch.setattr(app_module, "_cli_configured", False)
 
     yield
@@ -537,3 +555,235 @@ def test_bind_guardrails_and_bool_precedence(monkeypatch, tmp_path, capsys):
             ]
         )
     assert exc_info.value.code == 2
+
+
+# --- Spec 01 (.env.example) & Spec 02 (Rate Limiting, TPM, Backoff, Quotas) ---
+def test_env_example_is_documented_and_safe():
+    env_example_path = os.path.join(os.path.dirname(__file__), "..", ".env.example")
+    assert os.path.exists(env_example_path)
+    raw = open(env_example_path, "r", encoding="utf-8").read()
+    assert "NVIDIA_API_KEY=nvapi-YOUR_REAL_KEY_HERE" in raw
+    for var in (
+        "RPM",
+        "TPM",
+        "MAX_WAIT_SECONDS",
+        "DAILY_REQUEST_CAP",
+        "DAILY_TOKEN_CAP",
+        "ALLOW_NON_LOCAL_BIND",
+        "STRICT_TRIAL_GUARDRAILS",
+    ):
+        assert var in raw
+
+    parsed = dotenv_values(env_example_path)
+    assert parsed["NVIDIA_API_KEY"] == "nvapi-YOUR_REAL_KEY_HERE"
+
+
+def test_parse_retry_after_formats():
+    now = 1_700_000_000.0
+    assert parse_retry_after({"Retry-After": "12"}, now=now) == 12.0
+    assert parse_retry_after({"retry-after": "2.5"}, now=now) == 2.5
+    assert parse_retry_after({"x-ratelimit-reset-requests": "500ms"}, now=now) == 0.5
+    assert parse_retry_after({"x-ratelimit-reset-tokens": "1m30s"}, now=now) == 90.0
+    assert parse_retry_after({"x-ratelimit-reset": str(now + 15.0)}, now=now) == pytest.approx(15.0, abs=0.01)
+
+    http_date = email.utils.formatdate(now + 20.0, usegmt=True)
+    assert parse_retry_after({"Retry-After": http_date}, now=now) == pytest.approx(20.0, abs=1.0)
+    assert parse_retry_after({"Retry-After": "invalid-value"}, now=now) is None
+
+
+@pytest.mark.asyncio
+async def test_tpm_bucket_reservation_and_reconciliation():
+    bucket = TPMBucket(tpm=1000, window_seconds=60.0)
+    assert bucket.enabled is True
+    assert bucket.tokens == 1000.0
+
+    # Reserve 400 tokens
+    wait_time, reserved = await bucket.acquire(400, max_wait_seconds=0.5)
+    assert wait_time == 0.0
+    assert reserved == 400
+    assert bucket.tokens <= 605.0
+
+    # Overestimate refund: actual was 150 -> refund 250
+    await bucket.reconcile(reserved, actual_tokens=150)
+    assert 840.0 <= bucket.tokens <= 860.0
+
+    # Error refund: actual is None -> refund full reservation
+    _, reserved2 = await bucket.acquire(300, max_wait_seconds=0.5)
+    await bucket.reconcile(reserved2, actual_tokens=None)
+    assert 840.0 <= bucket.tokens <= 865.0
+
+    # Exceeding remaining tokens with tight max_wait_seconds raises RateLimitExceeded without deducting
+    before = bucket.tokens
+    with pytest.raises(RateLimitExceeded) as exc_info:
+        await bucket.acquire(950, max_wait_seconds=0.05)
+    assert exc_info.value.error == "rate_limit_wait_exceeded"
+    assert abs(bucket.tokens - before) < 5.0
+
+
+@pytest.mark.asyncio
+async def test_per_model_overrides_and_yaml_validation(tmp_path):
+    yaml_file = tmp_path / "models.yaml"
+    yaml_file.write_text(
+        yaml.safe_dump(
+            {
+                "rate_limit": {
+                    "requests_per_minute": 60.0,
+                    "window_seconds": 60.0,
+                    "burst_capacity": 10.0,
+                    "max_wait_seconds": 0.05,
+                    "models": {
+                        "deepseek-ai/deepseek-r1": {
+                            "requests_per_minute": 1.0,
+                            "burst_capacity": 1.0,
+                            "tokens_per_minute": 500,
+                            "concurrency_limit": 1,
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = resolve_settings(
+        argv=["--nvidia-api-key", "nvapi-ok", "--config-file", str(yaml_file)],
+        environ={},
+    )
+    assert "deepseek-ai/deepseek-r1" in resolved.model_rate_limits
+
+    mgr = RateLimitManager.from_config(resolved.to_config_dict())
+    # First request for deepseek-ai/deepseek-r1 succeeds
+    res = await mgr.acquire_request("deepseek-ai/deepseek-r1", estimated_tokens=100)
+    await mgr.reconcile_tokens(res, 100)
+
+    # Second immediate request hits per-model 1-burst limit & fails fast due to max_wait_seconds=0.05
+    with pytest.raises(RateLimitExceeded) as exc_info:
+        await mgr.acquire_request("deepseek-ai/deepseek-r1", estimated_tokens=100)
+    assert exc_info.value.detail["reason"] == "rpm_limit"
+
+    # Unlisted model still uses global 10-burst limit
+    res_other = await mgr.acquire_request("meta/llama-3.1-8b-instruct", estimated_tokens=100)
+    assert res_other["model_tpm_reserved"] == 0
+
+    # Invalid per-model config raises ConfigError
+    bad_yaml = tmp_path / "bad_models.yaml"
+    bad_yaml.write_text(
+        yaml.safe_dump({"rate_limit": {"models": {"bad/model": {"requests_per_minute": -5}}}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="rate_limit.models"):
+        resolve_settings(
+            argv=["--nvidia-api-key", "nvapi-ok", "--config-file", str(bad_yaml)],
+            environ={},
+        )
+
+
+def test_proxy_max_wait_seconds_fast_fail_and_logs(monkeypatch):
+    monkeypatch.setenv("RPM", "1")
+    monkeypatch.setenv("BURST_CAPACITY", "1")
+    monkeypatch.setenv("MAX_WAIT_SECONDS", "0.05")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"id": "ok", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
+        )
+
+    transport = httpx.MockTransport(handler)
+    with TestClient(app) as client:
+        app_module.http_client = httpx.AsyncClient(
+            base_url="https://mock.nvidia.test",
+            transport=transport,
+        )
+        r1 = client.post("/v1/chat/completions", json={"model": "meta/llama-3.1-8b-instruct"})
+        assert r1.status_code == 200
+
+        # Second immediate request exceeds max_wait_seconds=0.05 -> local 429
+        r2 = client.post("/v1/chat/completions", json={"model": "meta/llama-3.1-8b-instruct"})
+        assert r2.status_code == 429
+        assert r2.json()["error"] == "rate_limit_wait_exceeded"
+        assert int(r2.headers["Retry-After"]) >= 1
+
+        metrics = client.get("/admin/metrics").json()
+        assert metrics["throttled_requests"] >= 1
+
+
+def test_proxy_daily_request_and_token_caps(monkeypatch):
+    monkeypatch.setenv("RPM", "60")
+    monkeypatch.setenv("BURST_CAPACITY", "10")
+    monkeypatch.setenv("DAILY_REQUEST_CAP", "1")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"id": "ok", "usage": {"prompt_tokens": 40, "completion_tokens": 20, "total_tokens": 60}},
+        )
+
+    transport = httpx.MockTransport(handler)
+    with TestClient(app) as client:
+        app_module.http_client = httpx.AsyncClient(
+            base_url="https://mock.nvidia.test",
+            transport=transport,
+        )
+        r1 = client.post("/v1/chat/completions", json={"model": "meta/llama-3.1-8b-instruct"})
+        assert r1.status_code == 200
+
+        # Wait briefly for background log_request task from stream_generator to commit
+        time.sleep(0.15)
+
+        r2 = client.post("/v1/chat/completions", json={"model": "meta/llama-3.1-8b-instruct"})
+        assert r2.status_code == 429
+        body2 = r2.json()
+        assert body2["error"] == "daily_quota_exceeded"
+        assert body2["quota_type"] == "requests"
+        assert int(r2.headers["Retry-After"]) >= 1
+
+        # Raise request cap and enforce daily_token_cap (already used 60 tokens >= 50)
+        client.post(
+            "/admin/config",
+            json={"rate_limit": {"daily_request_cap": 100, "daily_token_cap": 50}},
+        )
+        r3 = client.post("/v1/chat/completions", json={"model": "meta/llama-3.1-8b-instruct"})
+        assert r3.status_code == 429
+        body3 = r3.json()
+        assert body3["error"] == "daily_quota_exceeded"
+        assert body3["quota_type"] == "tokens"
+
+
+def test_upstream_429_triggers_model_cooldown_and_backoff(monkeypatch):
+    monkeypatch.setenv("RPM", "60")
+    monkeypatch.setenv("BURST_CAPACITY", "10")
+    monkeypatch.setenv("MAX_WAIT_SECONDS", "0.05")
+
+    upstream_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "10"},
+            json={"error": "upstream rate limited"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    with TestClient(app) as client:
+        app_module.http_client = httpx.AsyncClient(
+            base_url="https://mock.nvidia.test",
+            transport=transport,
+        )
+
+        # First call hits upstream and receives 429 Retry-After: 10
+        r1 = client.post("/v1/chat/completions", json={"model": "deepseek-ai/deepseek-r1"})
+        assert r1.status_code == 429
+        assert upstream_calls == 1
+
+        # Second call for same model hits adaptive cooldown locally without hitting upstream
+        r2 = client.post("/v1/chat/completions", json={"model": "deepseek-ai/deepseek-r1"})
+        assert r2.status_code == 429
+        assert r2.json()["reason"] == "upstream_cooldown"
+        assert upstream_calls == 1
+
+        status_data = client.get("/status").json()
+        assert status_data["rate_limiter"]["upstream_throttled_count"] == 1
+        assert "deepseek-ai/deepseek-r1" in status_data["rate_limiter"]["active_cooldowns"]

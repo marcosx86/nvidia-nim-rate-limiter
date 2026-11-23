@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import re
 import sys
@@ -15,12 +16,19 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
 import database
+from rate_limiter import (
+    RateLimitExceeded,
+    RateLimitManager,
+    TokenBucket,
+    estimate_request_tokens,
+)
 from settings import (
     AppSettings,
     ConfigError,
     build_arg_parser,
     resolve_settings,
     validate_bind_guardrails,
+    validate_model_rate_limits,
 )
 
 
@@ -91,42 +99,6 @@ def load_config(
     return cfg
 
 
-# --- Token Bucket Rate Limiter ---
-class TokenBucket:
-    def __init__(self, rpm: float, window_seconds: float, capacity: float):
-        self.capacity = float(capacity)
-        self.tokens = float(capacity)
-        self.fill_rate = float(rpm) / float(window_seconds) if window_seconds > 0 else 1.0
-        self.last_update = time.monotonic()
-        self._lock = asyncio.Lock()
-
-    def update_params(self, rpm: float, window_seconds: float, capacity: float):
-        self.capacity = float(capacity)
-        self.fill_rate = float(rpm) / float(window_seconds) if window_seconds > 0 else 1.0
-        self.tokens = min(self.tokens, self.capacity)
-
-    async def acquire(self) -> float:
-        """Acquires a token, sleeping if necessary. Returns wait time in seconds."""
-        wait_time = 0.0
-        while True:
-            async with self._lock:
-                now = time.monotonic()
-                elapsed = now - self.last_update
-                self.last_update = now
-                self.tokens = min(self.capacity, self.tokens + elapsed * self.fill_rate)
-
-                if self.tokens >= 1.0:
-                    self.tokens -= 1.0
-                    return wait_time
-
-                # Calculate wait time needed for 1 full token
-                needed = 1.0 - self.tokens
-                wait_seconds = needed / self.fill_rate
-
-            wait_time += wait_seconds
-            await asyncio.sleep(wait_seconds)
-
-
 # --- Global State ---
 runtime_settings: AppSettings = resolve_settings(
     argv=[],
@@ -139,15 +111,9 @@ config_data: Dict[str, Any] = runtime_settings.to_config_dict()
 NVIDIA_API_KEY: str = runtime_settings.nvidia_api_key
 _cli_configured: bool = False
 
-token_bucket = TokenBucket(
-    rpm=config_data["rate_limit"]["requests_per_minute"],
-    window_seconds=config_data["rate_limit"]["window_seconds"],
-    capacity=config_data["rate_limit"]["burst_capacity"],
-)
-
-concurrency_semaphore = asyncio.Semaphore(
-    config_data["proxy"]["concurrency_limit"]
-)
+rate_limit_manager = RateLimitManager.from_config(config_data)
+token_bucket: TokenBucket = rate_limit_manager.global_rpm
+concurrency_semaphore: asyncio.Semaphore = rate_limit_manager.global_semaphore
 
 http_client: Optional[httpx.AsyncClient] = None
 
@@ -161,7 +127,7 @@ def configure_runtime(
 ) -> AppSettings:
     """Resolve settings with strict precedence and apply them to runtime state."""
     global runtime_settings, CONFIG_FILE, WWWROOT_DIR, config_data
-    global NVIDIA_API_KEY, concurrency_semaphore, _cli_configured
+    global NVIDIA_API_KEY, token_bucket, concurrency_semaphore, _cli_configured
 
     resolved = resolve_settings(
         argv=argv,
@@ -179,12 +145,9 @@ def configure_runtime(
     if not os.path.exists(CONFIG_FILE):
         save_config(config_data, CONFIG_FILE)
 
-    token_bucket.update_params(
-        rpm=config_data["rate_limit"]["requests_per_minute"],
-        window_seconds=config_data["rate_limit"]["window_seconds"],
-        capacity=config_data["rate_limit"]["burst_capacity"],
-    )
-    concurrency_semaphore = asyncio.Semaphore(config_data["proxy"]["concurrency_limit"])
+    rate_limit_manager.configure_from_dict(config_data)
+    token_bucket = rate_limit_manager.global_rpm
+    concurrency_semaphore = rate_limit_manager.global_semaphore
     return resolved
 
 
@@ -238,11 +201,7 @@ async def healthz():
 async def status():
     return {
         "status": "healthy",
-        "rate_limiter": {
-            "tokens_available": round(token_bucket.tokens, 2),
-            "capacity": token_bucket.capacity,
-            "fill_rate_per_sec": round(token_bucket.fill_rate, 4),
-        },
+        "rate_limiter": rate_limit_manager.status_snapshot(),
         "concurrency": {
             "limit": config_data["proxy"]["concurrency_limit"],
             "active_tasks": config_data["proxy"]["concurrency_limit"] - concurrency_semaphore._value,
@@ -256,8 +215,13 @@ async def status():
 async def admin_metrics():
     db_path = config_data["db"]["path"]
     metrics = await database.get_metrics(db_path)
-    metrics["current_tokens"] = round(token_bucket.tokens, 2)
-    metrics["capacity"] = token_bucket.capacity
+    snapshot = rate_limit_manager.status_snapshot()
+    metrics["current_tokens"] = snapshot["tokens_available"]
+    metrics["capacity"] = snapshot["capacity"]
+    metrics["tpm_available"] = snapshot["tpm_available"]
+    metrics["tpm_capacity"] = snapshot["tpm_capacity"]
+    metrics["active_cooldowns"] = snapshot["active_cooldowns"]
+    metrics["upstream_throttled_count"] = snapshot["upstream_throttled_count"]
     metrics["active_concurrency"] = config_data["proxy"]["concurrency_limit"] - concurrency_semaphore._value
     return metrics
 
@@ -290,26 +254,26 @@ async def get_admin_config():
 
 @app.post("/admin/config", tags=["Admin"])
 async def update_admin_config(new_config: Dict[str, Any]):
-    global config_data, concurrency_semaphore
+    global config_data, token_bucket, concurrency_semaphore
     try:
         if "admin" in new_config:
             config_data["admin"].update(new_config["admin"])
         if "proxy" in new_config:
             config_data["proxy"].update(new_config["proxy"])
         if "rate_limit" in new_config:
-            config_data["rate_limit"].update(new_config["rate_limit"])
+            rl_update = dict(new_config["rate_limit"])
+            if "models" in rl_update:
+                rl_update["models"] = validate_model_rate_limits(rl_update["models"])
+            config_data["rate_limit"].update(rl_update)
         if "db" in new_config:
             config_data["db"].update(new_config["db"])
 
         save_config(config_data, CONFIG_FILE)
 
         # Update in-memory structures
-        token_bucket.update_params(
-            rpm=config_data["rate_limit"]["requests_per_minute"],
-            window_seconds=config_data["rate_limit"]["window_seconds"],
-            capacity=config_data["rate_limit"]["burst_capacity"],
-        )
-        concurrency_semaphore = asyncio.Semaphore(config_data["proxy"]["concurrency_limit"])
+        rate_limit_manager.configure_from_dict(config_data)
+        token_bucket = rate_limit_manager.global_rpm
+        concurrency_semaphore = rate_limit_manager.global_semaphore
         if http_client is not None:
             http_client.base_url = httpx.URL(config_data["proxy"]["upstream_url"])
 
@@ -348,28 +312,96 @@ async def proxy_request(path: str, request: Request):
     start_time = time.time()
     db_path = config_data["db"]["path"]
 
-    # 1. Rate Limiting Wait
     try:
-        await token_bucket.acquire()
+        body = await request.body()
     except (ClientDisconnect, asyncio.CancelledError):
         return Response(status_code=499)
 
-    # 2. Concurrency Control & Proxying
-    async with concurrency_semaphore:
+    model_name: Optional[str] = None
+    body_json: Optional[Dict[str, Any]] = None
+    if body:
         try:
-            body = await request.body()
-        except (ClientDisconnect, asyncio.CancelledError):
-            return Response(status_code=499)
+            parsed = json.loads(body.decode("utf-8"))
+            if isinstance(parsed, dict):
+                body_json = parsed
+                model_name = parsed.get("model")
+        except Exception:
+            pass
 
-        model_name = None
-        if body:
-            try:
-                body_json = json.loads(body.decode("utf-8"))
-                if isinstance(body_json, dict):
-                    model_name = body_json.get("model")
-            except Exception:
-                pass
+    # 1. Daily Quota Caps (UTC day)
+    rate_cfg = config_data.get("rate_limit", {})
+    daily_req_cap = int(rate_cfg.get("daily_request_cap", 0) or 0)
+    daily_tok_cap = int(rate_cfg.get("daily_token_cap", 0) or 0)
+    if daily_req_cap > 0 or daily_tok_cap > 0:
+        usage = await database.get_daily_usage(db_path)
+        retry_sec = int(max(1, math.ceil(usage["seconds_until_reset"])))
+        quota_payload: Optional[Dict[str, Any]] = None
+        if daily_req_cap > 0 and usage["requests"] >= daily_req_cap:
+            quota_payload = {
+                "error": "daily_quota_exceeded",
+                "quota_type": "requests",
+                "limit": daily_req_cap,
+                "used": usage["requests"],
+                "retry_after": retry_sec,
+            }
+        elif daily_tok_cap > 0 and usage["tokens"] >= daily_tok_cap:
+            quota_payload = {
+                "error": "daily_quota_exceeded",
+                "quota_type": "tokens",
+                "limit": daily_tok_cap,
+                "used": usage["tokens"],
+                "retry_after": retry_sec,
+            }
+        if quota_payload is not None:
+            latency_ms = (time.time() - start_time) * 1000.0
+            await database.log_request(
+                db_path=db_path,
+                method=request.method,
+                path="/" + path,
+                status_code=429,
+                latency_ms=latency_ms,
+                request_bytes=len(body),
+                response_bytes=0,
+                allowed=False,
+                model=model_name,
+            )
+            return JSONResponse(
+                status_code=429,
+                content=quota_payload,
+                headers={"Retry-After": str(retry_sec)},
+            )
 
+    # 2. Adaptive Cooldown, Per-Model + Global RPM & TPM Acquisition
+    estimated_tokens = estimate_request_tokens(body, body_json)
+    try:
+        reservation = await rate_limit_manager.acquire_request(
+            model=model_name,
+            estimated_tokens=estimated_tokens,
+        )
+    except RateLimitExceeded as exc:
+        latency_ms = (time.time() - start_time) * 1000.0
+        retry_sec = int(max(1, math.ceil(exc.retry_after)))
+        await database.log_request(
+            db_path=db_path,
+            method=request.method,
+            path="/" + path,
+            status_code=429,
+            latency_ms=latency_ms,
+            request_bytes=len(body),
+            response_bytes=0,
+            allowed=False,
+            model=model_name,
+        )
+        return JSONResponse(
+            status_code=429,
+            content=exc.detail,
+            headers={"Retry-After": str(retry_sec)},
+        )
+    except (ClientDisconnect, asyncio.CancelledError):
+        return Response(status_code=499)
+
+    # 3. Concurrency Control & Proxying
+    async with rate_limit_manager.semaphore_context(model_name):
         headers = dict(request.headers)
 
         # Never forward client's Authorization header
@@ -388,6 +420,7 @@ async def proxy_request(path: str, request: Request):
             upstream_path += "?" + request.url.query
 
         if http_client is None:
+            await rate_limit_manager.reconcile_tokens(reservation, None)
             raise HTTPException(status_code=500, detail="HTTP client not initialized")
 
         try:
@@ -398,6 +431,11 @@ async def proxy_request(path: str, request: Request):
                 content=body,
             )
             upstream_response = await http_client.send(req_builder, stream=True)
+            rate_limit_manager.record_upstream_status(
+                upstream_response.status_code,
+                upstream_response.headers,
+                model=model_name,
+            )
 
             response_headers = dict(upstream_response.headers)
             for h in ("content-length", "transfer-encoding", "connection"):
@@ -419,6 +457,8 @@ async def proxy_request(path: str, request: Request):
                     latency_ms = (time.time() - start_time) * 1000.0
                     response_text = b"".join(collected_chunks).decode("utf-8", errors="ignore")
                     prompt_tokens, completion_tokens, total_tokens = extract_tokens(response_text)
+                    reconcile_val = total_tokens if upstream_response.status_code < 400 else None
+                    await rate_limit_manager.reconcile_tokens(reservation, reconcile_val)
                     asyncio.create_task(
                         database.log_request(
                             db_path=db_path,
@@ -444,8 +484,10 @@ async def proxy_request(path: str, request: Request):
             )
 
         except (ClientDisconnect, asyncio.CancelledError):
+            await rate_limit_manager.reconcile_tokens(reservation, None)
             return Response(status_code=499)
         except Exception as e:
+            await rate_limit_manager.reconcile_tokens(reservation, None)
             latency_ms = (time.time() - start_time) * 1000.0
             asyncio.create_task(
                 database.log_request(

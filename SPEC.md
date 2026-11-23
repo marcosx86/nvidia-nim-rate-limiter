@@ -48,7 +48,7 @@ Hosted trial endpoints on `integrate.api.nvidia.com` are governed by the **NVIDI
 
 | Spec | Scope | Status |
 | :--- | :--- | :--- |
-| [`01-configuration-and-cli.md`](specs/01-configuration-and-cli.md) | Precedence (`argparse > env > dotenv > config.yaml > default/fail`), CLI entrypoint, bind guardrails | **Implemented** |
-| [`02-rate-limiting-and-429-backoff.md`](specs/02-rate-limiting-and-429-backoff.md) | Global/per-model `TokenBucket`, TPM limiting, `429`/`Retry-After` backoff, `--max-wait-seconds`, quota caps | **Partial** *(global RPM & concurrency implemented; per-model, TPM, `429` backoff planned)* |
+| [`01-configuration-and-cli.md`](specs/01-configuration-and-cli.md) | Precedence (`argparse > env > dotenv > config.yaml > default/fail`), CLI entrypoint, bind guardrails, `.env.example` | **Implemented** |
+| [`02-rate-limiting-and-429-backoff.md`](specs/02-rate-limiting-and-429-backoff.md) | Global/per-model `TokenBucket`, TPM limiting, `429`/`Retry-After` backoff, `--max-wait-seconds`, daily quota caps | **Implemented** |
 | [`03-trial-guardrails-and-upstream-routing.md`](specs/03-trial-guardrails-and-upstream-routing.md) | Trial-mode detection & banner, per-model upstream routing, model allowlist/denylist, catalog health | **Planned** |
 | [`04-privacy-headers-and-observability.md`](specs/04-privacy-headers-and-observability.md) | Secret/PII outbound guardrail, header hygiene, SQLite log retention purge, `/admin/` & `/status` updates | **Partial** *(SQLite metrics/logs & `/admin/` implemented; PII/header/retention planned)* |

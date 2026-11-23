@@ -2,7 +2,7 @@
 
 ## 1. Status
 
-- **Implemented:** `settings.py`, `app.py` (`configure_runtime`, `main`, `lifespan`), `Dockerfile`, `docker-compose.yml`
+- **Implemented:** `settings.py`, `app.py` (`configure_runtime`, `main`, `lifespan`), `.env.example`, `Dockerfile`, `docker-compose.yml`
 
 ---
 
@@ -42,3 +42,4 @@ Every runtime parameter MUST resolve strictly in this order:
 2. Missing `NVIDIA_API_KEY` raises `ConfigError` during `resolve_settings()`, FastAPI `lifespan`, and `app.main()` (exit code `2`).
 3. `config.yaml` never stores `nvidia_api_key`, and `/admin/config` and `/status` never expose it.
 4. Explicit invalid values (non-positive `RPM`, `MAX_CONCURRENT <= 0`, out-of-range `PORT`, missing explicit `--env-file`) raise `ConfigError`.
+5. Repository includes a tracked `.env.example` documenting all supported environment variables with comments and safe placeholder values.

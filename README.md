@@ -34,7 +34,11 @@ source .venv/bin/activate
 pip install -r requirements-dev.txt
 ```
 
-Set your NVIDIA API Key in `.env`:
+Copy `.env.example` to `.env` and set your NVIDIA API Key:
+
+```bash
+cp .env.example .env
+```
 
 ```env
 NVIDIA_API_KEY=nvapi-YOUR_REAL_KEY_HERE
@@ -84,6 +88,10 @@ Parameters are resolved strictly in the following precedence order:
 | `--rpm` | `RPM` | `rate_limit.requests_per_minute` | `6.0` | Allowed requests per window |
 | `--window-seconds` | `WINDOW_SECONDS` | `rate_limit.window_seconds` | `60.0` | Time window in seconds |
 | `--burst-capacity` | `BURST_CAPACITY` | `rate_limit.burst_capacity` | `6.0` | Max token bucket capacity |
+| `--tpm` | `TPM` | `rate_limit.tokens_per_minute` | `0` | Global Tokens-Per-Minute limit (`0` disables) |
+| `--max-wait-seconds` | `MAX_WAIT_SECONDS` | `rate_limit.max_wait_seconds` | `0.0` | Max queue wait before local `429` (`0` = wait indefinitely) |
+| `--daily-request-cap` | `DAILY_REQUEST_CAP` | `rate_limit.daily_request_cap` | `0` | UTC daily request cap (`0` disables) |
+| `--daily-token-cap` | `DAILY_TOKEN_CAP` | `rate_limit.daily_token_cap` | `0` | UTC daily LLM token cap (`0` disables) |
 | `--max-concurrent` | `MAX_CONCURRENT` | `proxy.concurrency_limit` | `1` | Max simultaneous requests upstream |
 | `--upstream-url` | `UPSTREAM_URL` | `proxy.upstream_url` | `https://integrate.api.nvidia.com` | Base URL of upstream NIM API |
 | `--db-path` | `DB_PATH` | `db.path` | `limiter.db` | Path to SQLite database file |

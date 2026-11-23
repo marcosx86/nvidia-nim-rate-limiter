@@ -41,6 +41,20 @@ def _parse_positive_float(value: Any) -> float:
     return parsed
 
 
+def _parse_non_negative_int(value: Any) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError("must be a non-negative integer")
+    return parsed
+
+
+def _parse_non_negative_float(value: Any) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise ValueError("must be a non-negative number")
+    return parsed
+
+
 def _parse_port(value: Any) -> int:
     parsed = int(value)
     if not (1 <= parsed <= 65535):
@@ -155,6 +169,46 @@ PARAM_SPECS: Tuple[ParamSpec, ...] = (
         help="Maximum token bucket burst capacity (default: 6.0).",
     ),
     ParamSpec(
+        name="tokens_per_minute",
+        cli_flag="--tpm",
+        env_var="TPM",
+        parser=_parse_non_negative_int,
+        default=0,
+        yaml_section="rate_limit",
+        yaml_key="tokens_per_minute",
+        help="Global Tokens-Per-Minute limit; 0 disables TPM limiting (default: 0).",
+    ),
+    ParamSpec(
+        name="max_wait_seconds",
+        cli_flag="--max-wait-seconds",
+        env_var="MAX_WAIT_SECONDS",
+        parser=_parse_non_negative_float,
+        default=0.0,
+        yaml_section="rate_limit",
+        yaml_key="max_wait_seconds",
+        help="Max seconds to wait in queue before returning local 429; 0 waits indefinitely (default: 0.0).",
+    ),
+    ParamSpec(
+        name="daily_request_cap",
+        cli_flag="--daily-request-cap",
+        env_var="DAILY_REQUEST_CAP",
+        parser=_parse_non_negative_int,
+        default=0,
+        yaml_section="rate_limit",
+        yaml_key="daily_request_cap",
+        help="Max allowed requests per UTC day before local 429; 0 disables (default: 0).",
+    ),
+    ParamSpec(
+        name="daily_token_cap",
+        cli_flag="--daily-token-cap",
+        env_var="DAILY_TOKEN_CAP",
+        parser=_parse_non_negative_int,
+        default=0,
+        yaml_section="rate_limit",
+        yaml_key="daily_token_cap",
+        help="Max allowed LLM tokens per UTC day before local 429; 0 disables (default: 0).",
+    ),
+    ParamSpec(
         name="db_path",
         cli_flag="--db-path",
         env_var="DB_PATH",
@@ -229,6 +283,10 @@ class AppSettings:
     requests_per_minute: float
     window_seconds: float
     burst_capacity: float
+    tokens_per_minute: int
+    max_wait_seconds: float
+    daily_request_cap: int
+    daily_token_cap: int
     db_path: str
     admin_title: str
     wwwroot_dir: str
@@ -236,6 +294,7 @@ class AppSettings:
     port: int
     allow_non_local_bind: bool = False
     strict_trial_guardrails: bool = False
+    model_rate_limits: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     sources: Dict[str, str] = field(default_factory=dict)
 
     def to_config_dict(self) -> Dict[str, Any]:
@@ -249,6 +308,11 @@ class AppSettings:
                 "requests_per_minute": self.requests_per_minute,
                 "window_seconds": self.window_seconds,
                 "burst_capacity": self.burst_capacity,
+                "tokens_per_minute": self.tokens_per_minute,
+                "max_wait_seconds": self.max_wait_seconds,
+                "daily_request_cap": self.daily_request_cap,
+                "daily_token_cap": self.daily_token_cap,
+                "models": {k: dict(v) for k, v in self.model_rate_limits.items()},
             },
             "db": {
                 "path": self.db_path,
@@ -348,6 +412,43 @@ def _resolve_single(
     )
 
 
+def validate_model_rate_limits(raw_models: Any) -> Dict[str, Dict[str, Any]]:
+    """Validate per-model rate limit overrides from config.yaml or /admin/config."""
+    if raw_models is None:
+        return {}
+    if not isinstance(raw_models, Mapping):
+        raise ConfigError("Invalid 'rate_limit.models': must be a mapping of model_id -> settings.")
+
+    validated: Dict[str, Dict[str, Any]] = {}
+    parsers: Dict[str, Callable[[Any], Any]] = {
+        "requests_per_minute": _parse_positive_float,
+        "window_seconds": _parse_positive_float,
+        "burst_capacity": _parse_positive_float,
+        "tokens_per_minute": _parse_non_negative_int,
+        "concurrency_limit": _parse_positive_int,
+    }
+    for model_name, model_cfg in raw_models.items():
+        model_id = str(model_name).strip()
+        if not model_id:
+            raise ConfigError("Invalid 'rate_limit.models' key: model name must be non-empty.")
+        if not isinstance(model_cfg, Mapping):
+            raise ConfigError(f"Invalid 'rate_limit.models.{model_id}': must be a mapping.")
+        cleaned: Dict[str, Any] = {}
+        for key, raw_val in model_cfg.items():
+            if key not in parsers:
+                raise ConfigError(
+                    f"Unsupported key '{key}' in 'rate_limit.models.{model_id}'."
+                )
+            try:
+                cleaned[key] = parsers[key](raw_val)
+            except Exception as exc:
+                raise ConfigError(
+                    f"Invalid value for 'rate_limit.models.{model_id}.{key}': {exc}"
+                ) from exc
+        validated[model_id] = cleaned
+    return validated
+
+
 def _load_yaml_file(path: str) -> Dict[str, Any]:
     if not path or not os.path.exists(path):
         return {}
@@ -424,7 +525,15 @@ def resolve_settings(
         resolved[spec.name] = value
         sources[spec.name] = source
 
-    return AppSettings(sources=sources, **resolved)
+    raw_models = (
+        yaml_config.get("rate_limit", {}).get("models")
+        if isinstance(yaml_config.get("rate_limit"), Mapping)
+        else None
+    )
+    model_rate_limits = validate_model_rate_limits(raw_models)
+    sources["model_rate_limits"] = "config.yaml" if model_rate_limits else "default"
+
+    return AppSettings(model_rate_limits=model_rate_limits, sources=sources, **resolved)
 
 
 def is_loopback_host(host: str) -> bool:
