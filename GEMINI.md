@@ -1,25 +1,17 @@
 # Repository Agent Directives (`nvidia-nim-rate-limiter`)
 
-## 1. Project Overview & Architecture
+## 1. MANDATORY: Specification-Driven Development (`SPEC.md` -> `specs/` -> Implementation)
 
-This repository is an asynchronous FastAPI reverse proxy, token-bucket rate limiter, and observability dashboard for **NVIDIA NIM APIs** (`integrate.api.nvidia.com`).
+**Hard Directive:** All non-trivial feature additions, architectural changes, or behavioral modifications MUST follow a **two-phase, spec-first** workflow. See [ARCHITECTURE.md](ARCHITECTURE.md) for the current system architecture and invariants.
 
-### Core Components
+### Two-Phase Turn Protocol
 
-- **`app.py`**: FastAPI application, `TokenBucket` rate limiter, concurrency semaphore, upstream `httpx.AsyncClient` streaming proxy, `extract_tokens` SSE/JSON usage parser, CLI `main()` entrypoint, and `/healthz`, `/status`, `/admin/*` endpoints.
-- **`settings.py`**: Declarative parameter specs, `argparse` CLI parser, and strict configuration precedence resolver (`argparse > environment var > dotenv > config.yaml > default or fail if required`).
-- **`database.py`**: Async SQLite (`aiosqlite`) persistence layer for `request_logs`, schema initialization/migrations, and aggregated metrics/log queries.
-- **`wwwroot/index.html`**: Static dark-mode Web Admin Dashboard served at `/admin/` with dynamic `admin.title` injection and interactive config/metrics/log filtering.
-- **`config.yaml`**: Persisted runtime configuration (`proxy`, `rate_limit`, `db`, `admin`).
-- **`tests/test_app.py`**: `pytest` + `pytest-asyncio` test suite.
-- **`Dockerfile` & `docker-compose.yml`**: Containerized deployment (default port `8199:8000`, persistent `data/` volume).
-
-### Architectural Invariants
-
-1. **Credential Isolation**: Clients never send or receive raw `nvapi-*` keys. Inject `NVIDIA_API_KEY` only on outbound upstream requests, and never log, expose in `/admin/config`, or commit API keys.
-2. **Low-Latency Streaming**: Preserve chunked/SSE streaming via `httpx.AsyncClient.stream` and `StreamingResponse` without buffering full LLM responses before forwarding.
-3. **Config & Docs Sync**: When adding or changing environment variables, `config.yaml` keys, or API endpoints, keep `app.py`, `config.yaml`, `docker-compose.yml`, and `README.md` consistent.
-4. **Safe Schema Evolution**: Any new columns or indexes on `request_logs` in `database.py` must include idempotent migration logic in `init_db` for existing SQLite databases.
+1. **Phase 1 — Update `SPEC.md` and `specs/` First:**
+   - Before writing or modifying application code for any new feature or behavioral change, update `SPEC.md` (and create/update the corresponding feature specification under `specs/`) so that requirements, API contracts, configuration changes, and acceptance criteria are explicitly documented.
+   - Keep `SPEC.md` and `specs/*.md` in sync with the intended behavior.
+2. **Phase 2 — Implement & Verify Against the Spec:**
+   - Implement the code changes in `app.py`, `settings.py`, `database.py`, `wwwroot/index.html`, etc., strictly matching the updated specification.
+   - Verify all acceptance criteria with automated tests in `tests/`.
 
 ---
 
