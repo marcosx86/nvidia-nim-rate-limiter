@@ -3,6 +3,7 @@ import ipaddress
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urlparse, urlunparse
 
 import yaml
 from dotenv import dotenv_values
@@ -256,6 +257,45 @@ PARAM_SPECS: Tuple[ParamSpec, ...] = (
         help="Path to SQLite request log database (default: limiter.db).",
     ),
     ParamSpec(
+        name="db_url",
+        cli_flag="--db-url",
+        env_var="DB_URL",
+        parser=_parse_non_empty_str,
+        default="",
+        secret=True,
+        help="Optional database URL (sqlite:///... or postgresql://...). Never persisted to config.yaml.",
+    ),
+    ParamSpec(
+        name="db_pool_min",
+        cli_flag="--db-pool-min",
+        env_var="DB_POOL_MIN",
+        parser=_parse_positive_int,
+        default=1,
+        yaml_section="db",
+        yaml_key="pool_min",
+        help="Minimum PostgreSQL connection pool size (default: 1).",
+    ),
+    ParamSpec(
+        name="db_pool_max",
+        cli_flag="--db-pool-max",
+        env_var="DB_POOL_MAX",
+        parser=_parse_positive_int,
+        default=5,
+        yaml_section="db",
+        yaml_key="pool_max",
+        help="Maximum PostgreSQL connection pool size (default: 5).",
+    ),
+    ParamSpec(
+        name="db_connect_timeout",
+        cli_flag="--db-connect-timeout",
+        env_var="DB_CONNECT_TIMEOUT",
+        parser=_parse_positive_float,
+        default=10.0,
+        yaml_section="db",
+        yaml_key="connect_timeout",
+        help="Database connection timeout in seconds (default: 10.0).",
+    ),
+    ParamSpec(
         name="admin_title",
         cli_flag="--admin-title",
         env_var="ADMIN_TITLE",
@@ -328,12 +368,19 @@ class AppSettings:
     daily_request_cap: int
     daily_token_cap: int
     db_path: str
+    db_url: str
+    db_pool_min: int
+    db_pool_max: int
+    db_connect_timeout: float
     admin_title: str
     wwwroot_dir: str
     host: str
     port: int
     allow_non_local_bind: bool = False
     strict_trial_guardrails: bool = False
+    migrate_only: bool = False
+    migration_status: bool = False
+    db_url_env: Optional[str] = None
     model_rate_limits: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     allowed_models: List[str] = field(default_factory=list)
     blocked_models: List[str] = field(default_factory=list)
@@ -342,6 +389,14 @@ class AppSettings:
 
     def to_config_dict(self) -> Dict[str, Any]:
         """Return non-secret runtime config dict matching config.yaml structure."""
+        db_section: Dict[str, Any] = {
+            "path": self.db_path,
+            "pool_min": self.db_pool_min,
+            "pool_max": self.db_pool_max,
+            "connect_timeout": self.db_connect_timeout,
+        }
+        if self.db_url_env:
+            db_section["url_env"] = self.db_url_env
         return {
             "proxy": {
                 "upstream_url": self.upstream_url,
@@ -363,9 +418,7 @@ class AppSettings:
                 "daily_token_cap": self.daily_token_cap,
                 "models": {k: dict(v) for k, v in self.model_rate_limits.items()},
             },
-            "db": {
-                "path": self.db_path,
-            },
+            "db": db_section,
             "admin": {
                 "title": self.admin_title,
             },
@@ -392,6 +445,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
             type=str,
             help=f"{spec.help}{env_hint}{req_hint}",
         )
+    parser.add_argument(
+        "--migrate-only",
+        dest="migrate_only",
+        action="store_true",
+        default=False,
+        help="Run pending database migrations, print status JSON, and exit without starting server.",
+    )
+    parser.add_argument(
+        "--migration-status",
+        dest="migration_status",
+        action="store_true",
+        default=False,
+        help="Inspect applied/pending database migrations, print status JSON, and exit.",
+    )
     return parser
 
 
@@ -572,6 +639,45 @@ def validate_model_routes(raw_routes: Any) -> Dict[str, Dict[str, Any]]:
     return validated
 
 
+def validate_db_yaml(db_yaml: Any) -> Optional[str]:
+    """Validate config.yaml 'db' section, rejecting embedded credentials and returning url_env."""
+    if not isinstance(db_yaml, Mapping):
+        return None
+    for forbidden_key in ("url", "dsn", "password", "db_url"):
+        if forbidden_key in db_yaml:
+            raise ConfigError(
+                f"Forbidden credential/DSN key '{forbidden_key}' in 'db' config.yaml section. "
+                "Set DB_URL via environment/.env or use 'db.url_env' to reference an env var name."
+            )
+    if "url_env" in db_yaml and db_yaml["url_env"] is not None:
+        env_name = str(db_yaml["url_env"]).strip()
+        if not env_name or "://" in env_name:
+            raise ConfigError(
+                "Invalid 'db.url_env': must be an environment variable name, not a raw URL."
+            )
+        return env_name
+    return None
+
+
+def sanitize_db_target(db_url: Optional[str], db_path: str) -> str:
+    """Return a credential-masked database target string for logs and /status."""
+    raw = (db_url or "").strip()
+    if not raw:
+        return f"sqlite:///{db_path}"
+    parsed = urlparse(raw)
+    if parsed.scheme.lower() == "sqlite":
+        return raw
+    if parsed.password is not None:
+        user = parsed.username or ""
+        host = parsed.hostname or ""
+        port_part = f":{parsed.port}" if parsed.port else ""
+        netloc = f"{user}:***@{host}{port_part}"
+        return urlunparse(
+            (parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+        )
+    return raw
+
+
 def _load_yaml_file(path: str) -> Dict[str, Any]:
     if not path or not os.path.exists(path):
         return {}
@@ -664,7 +770,29 @@ def resolve_settings(
     sources["blocked_models"] = "config.yaml" if blocked_models else "default"
     sources["model_routes"] = "config.yaml" if model_routes else "default"
 
+    db_yaml = yaml_config.get("db") if isinstance(yaml_config.get("db"), Mapping) else {}
+    db_url_env = validate_db_yaml(db_yaml)
+    if not resolved["db_url"] and db_url_env:
+        env_candidate = env_map.get(db_url_env)
+        if _has_value(env_candidate):
+            resolved["db_url"] = str(env_candidate).strip()
+            sources["db_url"] = f"env:{db_url_env}"
+        else:
+            dotenv_candidate = dotenv_map.get(db_url_env)
+            if _has_value(dotenv_candidate):
+                resolved["db_url"] = str(dotenv_candidate).strip()
+                sources["db_url"] = f"dotenv:{db_url_env}"
+
+    if resolved["db_pool_max"] < resolved["db_pool_min"]:
+        raise ConfigError(
+            f"Invalid database pool settings: db_pool_max ({resolved['db_pool_max']}) "
+            f"must be >= db_pool_min ({resolved['db_pool_min']})."
+        )
+
     return AppSettings(
+        migrate_only=bool(cli_values.get("migrate_only", False)),
+        migration_status=bool(cli_values.get("migration_status", False)),
+        db_url_env=db_url_env,
         model_rate_limits=model_rate_limits,
         allowed_models=allowed_models,
         blocked_models=blocked_models,

@@ -19,6 +19,10 @@ services:
       CATALOG_CACHE_TTL: ${CATALOG_CACHE_TTL:-300.0}
       ENFORCE_CATALOG: ${ENFORCE_CATALOG:-false}
       DB_PATH: ${DB_PATH:-data/limiter.db}
+      DB_URL: ${DB_URL:-}
+      DB_POOL_MIN: ${DB_POOL_MIN:-1}
+      DB_POOL_MAX: ${DB_POOL_MAX:-5}
+      DB_CONNECT_TIMEOUT: ${DB_CONNECT_TIMEOUT:-10.0}
       CONFIG_FILE: ${CONFIG_FILE:-data/config.yaml}
       ENV_FILE: ${ENV_FILE:-.env}
       ADMIN_TITLE: ${ADMIN_TITLE:-NVIDIA NIM Rate Limiter Dashboard}
@@ -45,6 +49,24 @@ services:
       retries: 3
       start_period: 5s
 
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    container_name: nvidia-nim-ratelimit-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ratelimiter}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ratelimiter}
+      POSTGRES_DB: ${POSTGRES_DB:-ratelimiter}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ratelimiter}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   data:
+  pgdata:
 

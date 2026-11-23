@@ -29,6 +29,7 @@ from settings import (
     build_arg_parser,
     resolve_settings,
     validate_bind_guardrails,
+    validate_db_yaml,
     validate_model_list,
     validate_model_rate_limits,
     validate_model_routes,
@@ -119,6 +120,13 @@ token_bucket: TokenBucket = rate_limit_manager.global_rpm
 concurrency_semaphore: asyncio.Semaphore = rate_limit_manager.global_semaphore
 model_router = ModelRouter.from_config(config_data, env_file=runtime_settings.env_file)
 catalog_cache = ModelCatalogCache(ttl_seconds=runtime_settings.catalog_cache_ttl)
+db_backend: database.DatabaseBackend = database.create_backend(
+    db_url=runtime_settings.db_url,
+    db_path=runtime_settings.db_path,
+    pool_min=runtime_settings.db_pool_min,
+    pool_max=runtime_settings.db_pool_max,
+    connect_timeout=runtime_settings.db_connect_timeout,
+)
 
 http_client: Optional[httpx.AsyncClient] = None
 
@@ -132,7 +140,7 @@ def configure_runtime(
 ) -> AppSettings:
     """Resolve settings with strict precedence and apply them to runtime state."""
     global runtime_settings, CONFIG_FILE, WWWROOT_DIR, config_data
-    global NVIDIA_API_KEY, token_bucket, concurrency_semaphore, _cli_configured
+    global NVIDIA_API_KEY, token_bucket, concurrency_semaphore, _cli_configured, db_backend
 
     resolved = resolve_settings(
         argv=argv,
@@ -156,6 +164,13 @@ def configure_runtime(
     model_router.configure_from_dict(config_data, env_file=resolved.env_file)
     catalog_cache.clear()
     catalog_cache.set_ttl(resolved.catalog_cache_ttl)
+    db_backend = database.create_backend(
+        db_url=resolved.db_url,
+        db_path=resolved.db_path,
+        pool_min=resolved.db_pool_min,
+        pool_max=resolved.db_pool_max,
+        connect_timeout=resolved.db_connect_timeout,
+    )
     return resolved
 
 
@@ -168,9 +183,8 @@ async def lifespan(app: FastAPI):
     if not _cli_configured:
         configure_runtime(argv=[], require_secrets=True, from_cli=False)
 
-    # Init DB schema
-    db_path = config_data["db"]["path"]
-    await database.init_db(db_path)
+    # Init & migrate database backend
+    await db_backend.init_and_migrate()
 
     # Init HTTP Client
     http_client = httpx.AsyncClient(
@@ -184,6 +198,7 @@ async def lifespan(app: FastAPI):
     )
     yield
     await model_router.aclose_all()
+    await db_backend.close()
     if http_client:
         await http_client.aclose()
 
@@ -216,6 +231,11 @@ async def status():
     return {
         "status": "healthy",
         "deployment_mode": deployment_mode,
+        "db": {
+            "backend": db_backend.backend_name,
+            "schema_version": db_backend.schema_version,
+            "target": db_backend.sanitized_target,
+        },
         "rate_limiter": rate_limit_manager.status_snapshot(),
         "governance": model_router.status_snapshot(),
         "catalog": catalog_cache.snapshot(),
@@ -230,14 +250,18 @@ async def status():
 # --- Admin Dashboard & Metrics API ---
 @app.get("/admin/metrics", tags=["Admin"])
 async def admin_metrics():
-    db_path = config_data["db"]["path"]
     proxy_cfg = config_data.get("proxy", {})
-    metrics = await database.get_metrics(db_path)
+    metrics = await db_backend.get_metrics()
     snapshot = rate_limit_manager.status_snapshot()
     metrics["deployment_mode"] = detect_deployment_mode(
         proxy_cfg.get("upstream_url", ""),
         proxy_cfg.get("deployment_mode", "auto"),
     )
+    metrics["db"] = {
+        "backend": db_backend.backend_name,
+        "schema_version": db_backend.schema_version,
+        "target": db_backend.sanitized_target,
+    }
     metrics["current_tokens"] = snapshot["tokens_available"]
     metrics["capacity"] = snapshot["capacity"]
     metrics["tpm_available"] = snapshot["tpm_available"]
@@ -262,16 +286,14 @@ async def admin_logs(
     path: Optional[str] = None,
     model: Optional[str] = None,
 ):
-    db_path = config_data["db"]["path"]
-    logs = await database.get_logs(
-        db_path,
+    logs = await db_backend.get_logs(
         limit=limit,
         offset=offset,
         status_code=status_code,
         path=path,
         model=model,
     )
-    recent_models = await database.get_recent_models_with_tokens(db_path, limit=3)
+    recent_models = await db_backend.get_recent_models_with_tokens(limit=3)
     return {"logs": logs, "limit": limit, "offset": offset, "recent_models": recent_models}
 
 
@@ -310,6 +332,7 @@ async def update_admin_config(new_config: Dict[str, Any]):
                 rl_update["models"] = validate_model_rate_limits(rl_update["models"])
             config_data["rate_limit"].update(rl_update)
         if "db" in new_config:
+            validate_db_yaml(new_config["db"])
             config_data["db"].update(new_config["db"])
 
         save_config(config_data, CONFIG_FILE)
@@ -320,6 +343,17 @@ async def update_admin_config(new_config: Dict[str, Any]):
         concurrency_semaphore = rate_limit_manager.global_semaphore
         model_router.configure_from_dict(config_data, env_file=runtime_settings.env_file)
         catalog_cache.set_ttl(float(config_data["proxy"].get("catalog_cache_ttl", 300.0)))
+        if "db" in new_config and not runtime_settings.db_url:
+            await db_backend.close()
+            db_backend_new = database.create_backend(
+                db_url="",
+                db_path=config_data["db"]["path"],
+                pool_min=int(config_data["db"].get("pool_min", 1)),
+                pool_max=int(config_data["db"].get("pool_max", 5)),
+                connect_timeout=float(config_data["db"].get("connect_timeout", 10.0)),
+            )
+            await db_backend_new.init_and_migrate()
+            globals()["db_backend"] = db_backend_new
         if http_client is not None:
             http_client.base_url = httpx.URL(config_data["proxy"]["upstream_url"])
 
@@ -356,7 +390,6 @@ async def proxy_request(path: str, request: Request):
         raise HTTPException(status_code=404, detail="Not Found")
 
     start_time = time.time()
-    db_path = config_data["db"]["path"]
 
     try:
         body = await request.body()
@@ -378,8 +411,7 @@ async def proxy_request(path: str, request: Request):
     policy_reason = model_router.check_model_policy(model_name)
     if policy_reason is not None:
         latency_ms = (time.time() - start_time) * 1000.0
-        await database.log_request(
-            db_path=db_path,
+        await db_backend.log_request(
             method=request.method,
             path="/" + path,
             status_code=403,
@@ -400,8 +432,7 @@ async def proxy_request(path: str, request: Request):
 
     if config_data.get("proxy", {}).get("enforce_catalog") and catalog_cache.is_known(model_name) is False:
         latency_ms = (time.time() - start_time) * 1000.0
-        await database.log_request(
-            db_path=db_path,
+        await db_backend.log_request(
             method=request.method,
             path="/" + path,
             status_code=404,
@@ -424,7 +455,7 @@ async def proxy_request(path: str, request: Request):
     daily_req_cap = int(rate_cfg.get("daily_request_cap", 0) or 0)
     daily_tok_cap = int(rate_cfg.get("daily_token_cap", 0) or 0)
     if daily_req_cap > 0 or daily_tok_cap > 0:
-        usage = await database.get_daily_usage(db_path)
+        usage = await db_backend.get_daily_usage()
         retry_sec = int(max(1, math.ceil(usage["seconds_until_reset"])))
         quota_payload: Optional[Dict[str, Any]] = None
         if daily_req_cap > 0 and usage["requests"] >= daily_req_cap:
@@ -445,8 +476,7 @@ async def proxy_request(path: str, request: Request):
             }
         if quota_payload is not None:
             latency_ms = (time.time() - start_time) * 1000.0
-            await database.log_request(
-                db_path=db_path,
+            await db_backend.log_request(
                 method=request.method,
                 path="/" + path,
                 status_code=429,
@@ -472,8 +502,7 @@ async def proxy_request(path: str, request: Request):
     except RateLimitExceeded as exc:
         latency_ms = (time.time() - start_time) * 1000.0
         retry_sec = int(max(1, math.ceil(exc.retry_after)))
-        await database.log_request(
-            db_path=db_path,
+        await db_backend.log_request(
             method=request.method,
             path="/" + path,
             status_code=429,
@@ -574,8 +603,7 @@ async def proxy_request(path: str, request: Request):
                     reconcile_val = total_tokens if upstream_response.status_code < 400 else None
                     await rate_limit_manager.reconcile_tokens(reservation, reconcile_val)
                     asyncio.create_task(
-                        database.log_request(
-                            db_path=db_path,
+                        db_backend.log_request(
                             method=request.method,
                             path="/" + path,
                             status_code=upstream_response.status_code,
@@ -604,8 +632,7 @@ async def proxy_request(path: str, request: Request):
             await rate_limit_manager.reconcile_tokens(reservation, None)
             latency_ms = (time.time() - start_time) * 1000.0
             asyncio.create_task(
-                database.log_request(
-                    db_path=db_path,
+                db_backend.log_request(
                     method=request.method,
                     path="/" + path,
                     status_code=502,
@@ -622,17 +649,48 @@ async def proxy_request(path: str, request: Request):
             )
 
 
+async def _run_cli_migration_command(resolved: AppSettings) -> Dict[str, Any]:
+    backend = database.create_backend(
+        db_url=resolved.db_url,
+        db_path=resolved.db_path,
+        pool_min=resolved.db_pool_min,
+        pool_max=resolved.db_pool_max,
+        connect_timeout=resolved.db_connect_timeout,
+    )
+    try:
+        if resolved.migrate_only:
+            await backend.init_and_migrate()
+        status_payload = await backend.get_migration_status()
+        status_payload["backend"] = backend.backend_name
+        status_payload["target"] = backend.sanitized_target
+        return status_payload
+    finally:
+        await backend.close()
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     """CLI entrypoint supporting argparse > env > dotenv > config.yaml > default/fail."""
     cli_args = sys.argv[1:] if argv is None else list(argv)
     try:
+        pre_resolved = resolve_settings(
+            argv=cli_args,
+            allow_yaml_fallback=True,
+            require_secrets=False,
+        )
+        if pre_resolved.migrate_only or pre_resolved.migration_status:
+            payload = asyncio.run(_run_cli_migration_command(pre_resolved))
+            print(json.dumps(payload, indent=2))
+            return
+
         resolved = configure_runtime(argv=cli_args, require_secrets=True, from_cli=True)
         warning = validate_bind_guardrails(resolved)
         if warning:
             print(warning, file=sys.stderr)
-    except ConfigError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
-        raise SystemExit(2) from exc
+    except (ConfigError, Exception) as exc:
+        if isinstance(exc, ConfigError) or exc.__class__.__name__ == "MigrationError":
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        raise
 
     uvicorn.run(app, host=resolved.host, port=resolved.port, workers=1)
 

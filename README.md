@@ -98,6 +98,12 @@ Parameters are resolved strictly in the following precedence order:
 | `--catalog-cache-ttl` | `CATALOG_CACHE_TTL` | `proxy.catalog_cache_ttl` | `300.0` | Seconds to cache `/v1/models` catalog (`0` disables) |
 | `--enforce-catalog` | `ENFORCE_CATALOG` | `proxy.enforce_catalog` | `false` | Return `404` for models missing from cached `/v1/models` catalog |
 | `--db-path` | `DB_PATH` | `db.path` | `limiter.db` | Path to SQLite database file |
+| `--db-url` | `DB_URL` | `db.url_env` *(env ref only)* | - | Optional DB URL (`sqlite:///...` or `postgresql://...`) |
+| `--db-pool-min` | `DB_POOL_MIN` | `db.pool_min` | `1` | Minimum PostgreSQL pool connections |
+| `--db-pool-max` | `DB_POOL_MAX` | `db.pool_max` | `5` | Maximum PostgreSQL pool connections |
+| `--db-connect-timeout` | `DB_CONNECT_TIMEOUT` | `db.connect_timeout` | `10.0` | Database connection timeout in seconds |
+| `--migrate-only` | - | - | `false` | Apply pending DB migrations, print JSON status, and exit |
+| `--migration-status` | - | - | `false` | Inspect applied/pending DB migrations, print JSON, and exit |
 | `--admin-title` | `ADMIN_TITLE` | `admin.title` | `NVIDIA NIM Rate Limiter Dashboard` | Dashboard HTML `<title>` and header |
 | `--config-file` | `CONFIG_FILE` | - | `config.yaml` | Path to YAML configuration file |
 | `--env-file` | `ENV_FILE` | - | `.env` | Path to dotenv file |

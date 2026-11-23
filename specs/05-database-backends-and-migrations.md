@@ -2,7 +2,7 @@
 
 ## 1. Status
 
-- **Planned**
+- **Implemented:** `migrations.py` (`Migration`, `MigrationError`, `MIGRATIONS`, `run_sqlite_migrations`, `run_postgres_migrations`, `get_sqlite_migration_status`, `get_postgres_migration_status`), `database.py` (`DatabaseBackend`, `SQLiteBackend`, `PostgresBackend`, `create_backend`), `settings.py`, `app.py`
 
 ---
 

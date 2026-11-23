@@ -8,7 +8,8 @@ This repository is an asynchronous FastAPI reverse proxy, token-bucket rate limi
 - **`rate_limiter.py`**: Global and per-model `TokenBucket` (RPM), `TPMBucket` (Tokens-Per-Minute), concurrency semaphores, adaptive `429`/`Retry-After` cooldowns, and `--max-wait-seconds` enforcement.
 - **`routing.py`**: Trial/self-hosted/partner deployment mode detection, per-model upstream graduation routing, allowlist/denylist governance, and passive `/v1/models` catalog caching.
 - **`settings.py`**: Declarative parameter specs, `argparse` CLI parser, bind guardrails, and strict configuration precedence resolver (`argparse > environment var > dotenv > config.yaml > default or fail if required`).
-- **`database.py`**: Async SQLite (`aiosqlite`) persistence layer for `request_logs`, schema initialization/migrations, and aggregated metrics/log queries.
+- **`database.py`**: Async repository layer (`DatabaseBackend`) supporting `SQLiteBackend` (`aiosqlite`) and `PostgresBackend` (`asyncpg`) for `request_logs`, aggregated metrics, log filtering, daily quota usage, and retention pruning.
+- **`migrations.py`**: Dialect-agnostic, transactional, SHA-256-verified schema migration runner (`schema_migrations`) supporting SQLite legacy adoption and PostgreSQL advisory-lock execution.
 - **`wwwroot/index.html`**: Static dark-mode Web Admin Dashboard served at `/admin/` with dynamic `admin.title` injection and interactive config/metrics/log filtering.
 - **`config.yaml`**: Persisted runtime configuration (`proxy`, `rate_limit`, `db`, `admin`).
 - **`tests/test_app.py`**: `pytest` + `pytest-asyncio` test suite.

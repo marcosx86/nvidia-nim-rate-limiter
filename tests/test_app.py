@@ -1,8 +1,10 @@
 import email.utils
 import json
 import os
+import sys
 import time
 
+import aiosqlite
 import httpx
 import pytest
 import yaml
@@ -11,7 +13,10 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 import database
+import migrations
 from app import TokenBucket, app, extract_tokens
+from database import PostgresBackend, SQLiteBackend, create_backend
+from migrations import Migration, MigrationError
 from rate_limiter import (
     RateLimitExceeded,
     RateLimitManager,
@@ -19,7 +24,13 @@ from rate_limiter import (
     parse_retry_after,
 )
 from routing import detect_deployment_mode
-from settings import ConfigError, is_loopback_host, resolve_settings, validate_bind_guardrails
+from settings import (
+    ConfigError,
+    is_loopback_host,
+    resolve_settings,
+    sanitize_db_target,
+    validate_bind_guardrails,
+)
 
 TEST_DB = "test_limiter.db"
 
@@ -55,6 +66,10 @@ def setup_test_env(tmp_path, monkeypatch):
     monkeypatch.delenv("PORT", raising=False)
     monkeypatch.delenv("ALLOW_NON_LOCAL_BIND", raising=False)
     monkeypatch.delenv("STRICT_TRIAL_GUARDRAILS", raising=False)
+    monkeypatch.delenv("DB_URL", raising=False)
+    monkeypatch.delenv("DB_POOL_MIN", raising=False)
+    monkeypatch.delenv("DB_POOL_MAX", raising=False)
+    monkeypatch.delenv("DB_CONNECT_TIMEOUT", raising=False)
     monkeypatch.setattr(app_module, "_cli_configured", False)
     app_module.rate_limit_manager.global_rpm.tokens = app_module.rate_limit_manager.global_rpm.capacity
     app_module.rate_limit_manager._cooldown_until.clear()
@@ -1018,3 +1033,305 @@ def test_passive_catalog_cache_and_enforce_catalog_404(monkeypatch):
         r_known = client.post("/v1/chat/completions", json={"model": "meta/llama-3.3-70b-instruct"})
         assert r_known.status_code == 200
         assert upstream_calls == calls_before + 1
+
+
+# --- Spec 05: PostgreSQL Backend & Universal Database Migrations ---
+@pytest.mark.asyncio
+async def test_sqlite_versioned_migrations_idempotent_and_checksum_drift(tmp_path):
+    db_file = str(tmp_path / "mig.db")
+    applied_first = await migrations.run_sqlite_migrations(db_file)
+    assert applied_first == [1, 2, 3]
+
+    applied_second = await migrations.run_sqlite_migrations(db_file)
+    assert applied_second == []
+
+    status = await migrations.get_sqlite_migration_status(db_file)
+    assert status["current_version"] == 3
+    assert [m["version"] for m in status["applied"]] == [1, 2, 3]
+    assert status["pending"] == []
+
+    # Modifying an already-applied migration's SQL triggers MigrationError on checksum drift
+    tampered = (
+        Migration(
+            version=1,
+            name="001_initial_request_logs",
+            sqlite_statements=("CREATE TABLE IF NOT EXISTS tampered (id INTEGER)",),
+            postgres_statements=migrations.MIGRATIONS[0].postgres_statements,
+        ),
+        *migrations.MIGRATIONS[1:],
+    )
+    with pytest.raises(MigrationError, match="Checksum mismatch"):
+        await migrations.run_sqlite_migrations(db_file, migrations=tampered)
+
+
+@pytest.mark.asyncio
+async def test_legacy_sqlite_database_adoption_preserves_rows(tmp_path):
+    legacy_db = str(tmp_path / "legacy.db")
+    async with aiosqlite.connect(legacy_db) as db:
+        await db.execute(
+            """
+            CREATE TABLE request_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                status_code INTEGER NOT NULL,
+                latency_ms REAL NOT NULL,
+                request_bytes INTEGER NOT NULL DEFAULT 0,
+                response_bytes INTEGER NOT NULL DEFAULT 0,
+                allowed INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        await db.execute(
+            "INSERT INTO request_logs (timestamp, method, path, status_code, latency_ms) "
+            "VALUES (1700000000.0, 'POST', '/v1/chat/completions', 200, 42.0)"
+        )
+        await db.commit()
+
+    backend = SQLiteBackend(legacy_db)
+    await backend.init_and_migrate()
+    assert backend.schema_version == 3
+
+    logs = await backend.get_logs()
+    assert len(logs) == 1
+    assert logs[0]["path"] == "/v1/chat/completions"
+    assert logs[0]["prompt_tokens"] == 0
+
+    pruned = await backend.prune_old_logs(retention_days=1)
+    assert pruned == 1
+    assert await backend.get_logs() == []
+
+
+def test_db_url_credential_redaction_and_yaml_validation(monkeypatch, tmp_path):
+    assert (
+        sanitize_db_target("postgresql://alice:s3cr3t@pg.internal:5432/nimdb", "limiter.db")
+        == "postgresql://alice:***@pg.internal:5432/nimdb"
+    )
+    assert sanitize_db_target("", "limiter.db") == "sqlite:///limiter.db"
+
+    bad_yaml = tmp_path / "bad_db.yaml"
+    bad_yaml.write_text(
+        yaml.safe_dump({"db": {"url": "postgresql://alice:s3cr3t@localhost:5432/nimdb"}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="Forbidden credential/DSN key"):
+        resolve_settings(
+            argv=["--nvidia-api-key", "nvapi-ok", "--config-file", str(bad_yaml)],
+            environ={},
+        )
+
+    bad_pool_yaml = tmp_path / "bad_pool.yaml"
+    bad_pool_yaml.write_text(
+        yaml.safe_dump({"db": {"pool_min": 10, "pool_max": 2}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="db_pool_max"):
+        resolve_settings(
+            argv=["--nvidia-api-key", "nvapi-ok", "--config-file", str(bad_pool_yaml)],
+            environ={},
+        )
+
+    # DB_URL is never written to config.yaml and password is masked in /status
+    sqlite_url_path = str(tmp_path / "from_url.db").replace("\\", "/")
+    cfg_path = tmp_path / "clean_cfg.yaml"
+    monkeypatch.setenv("DB_URL", f"sqlite:///{sqlite_url_path}")
+    monkeypatch.setenv("CONFIG_FILE", str(cfg_path))
+    with TestClient(app) as client:
+        status_json = client.get("/status").json()
+        assert status_json["db"]["backend"] == "sqlite"
+        assert status_json["db"]["schema_version"] == 3
+        assert sqlite_url_path in status_json["db"]["target"]
+        saved_yaml_text = cfg_path.read_text(encoding="utf-8")
+        assert "from_url.db" not in saved_yaml_text
+        saved_yaml = yaml.safe_load(saved_yaml_text)
+        assert "url" not in saved_yaml["db"]
+        assert "db_url" not in saved_yaml["db"]
+
+
+@pytest.mark.asyncio
+async def test_postgres_backend_advisory_lock_and_queries_mocked(monkeypatch):
+    # 1. Missing asyncpg raises clear ConfigError
+    monkeypatch.setitem(sys.modules, "asyncpg", None)
+    pg_missing = create_backend("postgresql://u:pw@localhost:5432/db", "limiter.db")
+    with pytest.raises(ConfigError, match="asyncpg"):
+        await pg_missing.init_and_migrate()
+
+    # 2. Full PostgresBackend + advisory-lock migration flow via mock pool
+    class FakeTx:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeConn:
+        def __init__(self, state):
+            self.state = state
+
+        def transaction(self):
+            return FakeTx()
+
+        async def execute(self, sql, *args):
+            self.state["executed"].append((sql.strip(), args))
+            if "SELECT pg_advisory_lock" in sql:
+                self.state["locks"].append(("lock", args[0]))
+            elif "SELECT pg_advisory_unlock" in sql:
+                self.state["locks"].append(("unlock", args[0]))
+            elif sql.strip().startswith("INSERT INTO schema_migrations"):
+                self.state["migrations"].append(
+                    {"version": args[0], "name": args[1], "applied_at": args[2], "checksum": args[3]}
+                )
+            elif sql.strip().startswith("INSERT INTO request_logs"):
+                self.state["rows"].append(
+                    {
+                        "id": len(self.state["rows"]) + 1,
+                        "timestamp": args[0],
+                        "method": args[1],
+                        "path": args[2],
+                        "model": args[3],
+                        "prompt_tokens": args[4],
+                        "completion_tokens": args[5],
+                        "total_tokens": args[6],
+                        "status_code": args[7],
+                        "latency_ms": args[8],
+                        "request_bytes": args[9],
+                        "response_bytes": args[10],
+                        "allowed": args[11],
+                    }
+                )
+            elif sql.strip().startswith("DELETE FROM request_logs"):
+                cutoff = args[0]
+                before = len(self.state["rows"])
+                self.state["rows"] = [r for r in self.state["rows"] if r["timestamp"] >= cutoff]
+                return f"DELETE {before - len(self.state['rows'])}"
+
+        async def fetch(self, sql, *args):
+            if "FROM schema_migrations" in sql:
+                return list(self.state["migrations"])
+            if "GROUP BY status_code" in sql:
+                counts = {}
+                for r in self.state["rows"]:
+                    counts[r["status_code"]] = counts.get(r["status_code"], 0) + 1
+                return [{"status_code": k, "count": v} for k, v in counts.items()]
+            if "GROUP BY model" in sql:
+                models = []
+                for r in reversed(self.state["rows"]):
+                    if r["model"] and r["total_tokens"] > 0 and r["model"] not in models:
+                        models.append(r["model"])
+                return [{"model": m} for m in models[: args[0]]]
+            if "FROM request_logs" in sql:
+                # Verify Postgres dialect uses $1/$2 and ILIKE when filters supplied
+                self.state["last_logs_sql"] = sql
+                return list(reversed(self.state["rows"]))
+            return []
+
+        async def fetchrow(self, sql, *args):
+            if "COUNT(*) AS total_requests" in sql:
+                rows = self.state["rows"]
+                return {
+                    "total_requests": len(rows),
+                    "allowed_requests": sum(1 for r in rows if r["allowed"] == 1),
+                    "throttled_requests": sum(1 for r in rows if r["allowed"] == 0),
+                    "avg_latency_ms": sum(r["latency_ms"] for r in rows) / len(rows) if rows else 0.0,
+                    "total_request_bytes": sum(r["request_bytes"] for r in rows),
+                    "total_response_bytes": sum(r["response_bytes"] for r in rows),
+                    "total_prompt_tokens": sum(r["prompt_tokens"] for r in rows),
+                    "total_completion_tokens": sum(r["completion_tokens"] for r in rows),
+                    "total_tokens": sum(r["total_tokens"] for r in rows),
+                }
+            if "COUNT(*) AS requests" in sql:
+                cutoff = args[0]
+                day_rows = [r for r in self.state["rows"] if r["allowed"] == 1 and r["timestamp"] >= cutoff]
+                return {
+                    "requests": len(day_rows),
+                    "tokens": sum(r["total_tokens"] for r in day_rows),
+                }
+            return None
+
+        async def fetchval(self, sql, *args):
+            if "information_schema.tables" in sql:
+                return True
+            if "timestamp >= $1" in sql:
+                return sum(1 for r in self.state["rows"] if r["timestamp"] >= args[0])
+            return 0
+
+    class FakeAcquire:
+        def __init__(self, conn):
+            self.conn = conn
+
+        async def __aenter__(self):
+            return self.conn
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakePool:
+        def __init__(self):
+            self.state = {"executed": [], "locks": [], "migrations": [], "rows": [], "closed": False}
+
+        def acquire(self):
+            return FakeAcquire(FakeConn(self.state))
+
+        async def close(self):
+            self.state["closed"] = True
+
+    pool = FakePool()
+    pg = PostgresBackend("postgresql://user:secret@db.internal:5432/ratelimiter", pool=pool)
+    assert pg.sanitized_target == "postgresql://user:***@db.internal:5432/ratelimiter"
+
+    await pg.init_and_migrate()
+    assert pg.schema_version == 3
+    assert pool.state["locks"] == [
+        ("lock", migrations.POSTGRES_MIGRATION_LOCK_KEY),
+        ("unlock", migrations.POSTGRES_MIGRATION_LOCK_KEY),
+    ]
+
+    await pg.log_request(
+        method="POST",
+        path="/v1/chat/completions",
+        status_code=200,
+        latency_ms=88.0,
+        model="meta/llama-3.3-70b-instruct",
+        prompt_tokens=100,
+        completion_tokens=50,
+    )
+    metrics = await pg.get_metrics()
+    assert metrics["total_requests"] == 1
+    assert metrics["total_tokens"] == 150
+    assert metrics["recent_models"] == ["meta/llama-3.3-70b-instruct"]
+
+    logs = await pg.get_logs(status_code=200, path="/v1/", model="llama")
+    assert len(logs) == 1
+    assert "ILIKE $2" in pool.state["last_logs_sql"]
+    assert "ILIKE $3" in pool.state["last_logs_sql"]
+
+    daily = await pg.get_daily_usage()
+    assert daily["requests"] == 1
+    assert daily["tokens"] == 150
+
+    await pg.close()
+    assert pool.state["closed"] is True
+
+
+def test_cli_migrate_only_and_migration_status(monkeypatch, tmp_path, capsys):
+    # Should succeed even without NVIDIA_API_KEY and without starting uvicorn
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setattr(
+        app_module.uvicorn,
+        "run",
+        lambda *a, **kw: pytest.fail("uvicorn.run should not be called for migration CLI flags"),
+    )
+    db_file = tmp_path / "cli_mig.db"
+    cfg_file = tmp_path / "cli_mig.yaml"
+
+    app_module.main(["--migration-status", "--db-path", str(db_file), "--config-file", str(cfg_file)])
+    before_out = json.loads(capsys.readouterr().out)
+    assert before_out["current_version"] == 0
+    assert len(before_out["pending"]) == 3
+
+    app_module.main(["--migrate-only", "--db-path", str(db_file), "--config-file", str(cfg_file)])
+    after_out = json.loads(capsys.readouterr().out)
+    assert after_out["backend"] == "sqlite"
+    assert after_out["current_version"] == 3
+    assert after_out["pending"] == []
