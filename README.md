@@ -123,6 +123,8 @@ Parameters are resolved strictly in the following precedence order:
 | `/healthz` | `GET` | System liveness probe (`status: ok`) |
 | `/status` | `GET` | Real-time proxy status, token bucket state, and active concurrency |
 | `/admin/` | `GET` | Web Dashboard interface |
+| `/admin/settings` | `GET` | Separated precedence-aware Settings UI |
+| `/admin/settings/state` | `GET` | Effective config, per-field lock/source metadata, and runtime info |
 | `/admin/metrics` | `GET` | Aggregated usage metrics JSON (RPM, avg latency, status codes) |
 | `/admin/logs` | `GET` | Queryable request history (`limit`, `offset`, `status_code`, `path`) |
 | `/admin/catalog` | `GET` | Inspect passively cached `/v1/models` catalog state |

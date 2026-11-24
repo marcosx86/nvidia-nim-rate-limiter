@@ -2,7 +2,7 @@
 
 ## 1. Status
 
-- **Planned**
+- **Implemented:** `settings.py` (`build_settings_source_metadata`, `normalize_admin_config_patch`), `app.py` (`/admin/settings`, `/admin/settings/state`, `POST /admin/config` lock enforcement), `wwwroot/index.html`, `wwwroot/settings.html`
 
 ---
 

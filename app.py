@@ -27,6 +27,8 @@ from settings import (
     AppSettings,
     ConfigError,
     build_arg_parser,
+    build_settings_source_metadata,
+    normalize_admin_config_patch,
     resolve_settings,
     validate_bind_guardrails,
     validate_db_yaml,
@@ -302,14 +304,47 @@ async def get_admin_config():
     return config_data
 
 
+@app.get("/admin/settings/state", tags=["Admin"])
+async def get_admin_settings_state():
+    return {
+        "config": config_data,
+        "sources": build_settings_source_metadata(runtime_settings),
+        "runtime_info": {
+            "nvidia_api_key_source": runtime_settings.sources.get("nvidia_api_key", "unset"),
+            "db_backend": db_backend.backend_name,
+            "db_target": db_backend.sanitized_target,
+            "db_url_source": runtime_settings.sources.get("db_url", "default"),
+            "host": runtime_settings.host,
+            "port": runtime_settings.port,
+        },
+    }
+
+
 @app.post("/admin/config", tags=["Admin"])
 async def update_admin_config(new_config: Dict[str, Any]):
-    global config_data, token_bucket, concurrency_semaphore
+    global config_data, token_bucket, concurrency_semaphore, db_backend
     try:
-        if "admin" in new_config:
-            config_data["admin"].update(new_config["admin"])
-        if "proxy" in new_config:
-            proxy_update = dict(new_config["proxy"])
+        normalized = normalize_admin_config_patch(new_config)
+        sources_meta = build_settings_source_metadata(runtime_settings)
+        ignored_locked_fields: list[str] = []
+
+        def _filter_locked(section: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+            allowed: Dict[str, Any] = {}
+            for key, val in patch.items():
+                path_key = f"{section}.{key}"
+                if sources_meta.get(path_key, {}).get("locked"):
+                    ignored_locked_fields.append(path_key)
+                else:
+                    allowed[key] = val
+            return allowed
+
+        if "admin" in normalized:
+            admin_update = _filter_locked("admin", normalized["admin"])
+            if admin_update:
+                config_data["admin"].update(admin_update)
+
+        if "proxy" in normalized:
+            proxy_update = _filter_locked("proxy", dict(normalized["proxy"]))
             if "deployment_mode" in proxy_update:
                 mode_val = str(proxy_update["deployment_mode"]).strip().lower()
                 if mode_val not in ("auto", "trial", "self_hosted", "partner"):
@@ -325,15 +360,31 @@ async def update_admin_config(new_config: Dict[str, Any]):
                 )
             if "model_routes" in proxy_update:
                 proxy_update["model_routes"] = validate_model_routes(proxy_update["model_routes"])
-            config_data["proxy"].update(proxy_update)
-        if "rate_limit" in new_config:
-            rl_update = dict(new_config["rate_limit"])
+            if proxy_update:
+                config_data["proxy"].update(proxy_update)
+
+        if "rate_limit" in normalized:
+            rl_update = _filter_locked("rate_limit", dict(normalized["rate_limit"]))
             if "models" in rl_update:
                 rl_update["models"] = validate_model_rate_limits(rl_update["models"])
-            config_data["rate_limit"].update(rl_update)
-        if "db" in new_config:
-            validate_db_yaml(new_config["db"])
-            config_data["db"].update(new_config["db"])
+            if rl_update:
+                config_data["rate_limit"].update(rl_update)
+
+        db_changed = False
+        if "db" in normalized:
+            db_update = _filter_locked("db", dict(normalized["db"]))
+            validate_db_yaml(db_update)
+            if "url_env" in db_update and db_update["url_env"] is None:
+                config_data["db"].pop("url_env", None)
+                db_update.pop("url_env")
+                db_changed = True
+            if db_update:
+                merged_db = dict(config_data["db"])
+                merged_db.update(db_update)
+                if int(merged_db.get("pool_max", 5)) < int(merged_db.get("pool_min", 1)):
+                    raise ValueError("Invalid database pool settings: pool_max must be >= pool_min.")
+                config_data["db"].update(db_update)
+                db_changed = True
 
         save_config(config_data, CONFIG_FILE)
 
@@ -343,7 +394,7 @@ async def update_admin_config(new_config: Dict[str, Any]):
         concurrency_semaphore = rate_limit_manager.global_semaphore
         model_router.configure_from_dict(config_data, env_file=runtime_settings.env_file)
         catalog_cache.set_ttl(float(config_data["proxy"].get("catalog_cache_ttl", 300.0)))
-        if "db" in new_config and not runtime_settings.db_url:
+        if db_changed and not runtime_settings.db_url:
             await db_backend.close()
             db_backend_new = database.create_backend(
                 db_url="",
@@ -353,11 +404,15 @@ async def update_admin_config(new_config: Dict[str, Any]):
                 connect_timeout=float(config_data["db"].get("connect_timeout", 10.0)),
             )
             await db_backend_new.init_and_migrate()
-            globals()["db_backend"] = db_backend_new
+            db_backend = db_backend_new
         if http_client is not None:
             http_client.base_url = httpx.URL(config_data["proxy"]["upstream_url"])
 
-        return {"status": "updated", "config": config_data}
+        return {
+            "status": "updated",
+            "config": config_data,
+            "ignored_locked_fields": ignored_locked_fields,
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to update configuration: {str(e)}")
 
@@ -375,6 +430,23 @@ async def admin_dashboard():
             return HTMLResponse(content=content)
     return HTMLResponse(
         content="<h1>Admin Dashboard</h1><p>wwwroot/index.html not found.</p>",
+        status_code=404,
+    )
+
+
+@app.get("/admin/settings", response_class=HTMLResponse, tags=["Admin"])
+@app.get("/admin/settings/", response_class=HTMLResponse, tags=["Admin"])
+async def admin_settings_page():
+    """Renders the separated Settings UI from wwwroot/settings.html."""
+    settings_file = os.path.join(WWWROOT_DIR, "settings.html")
+    if os.path.exists(settings_file):
+        with open(settings_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            title = config_data.get("admin", {}).get("title", "NVIDIA NIM Rate Limiter Dashboard")
+            content = content.replace("{{ ADMIN_TITLE }}", title)
+            return HTMLResponse(content=content)
+    return HTMLResponse(
+        content="<h1>Admin Settings</h1><p>wwwroot/settings.html not found.</p>",
         status_code=404,
     )
 

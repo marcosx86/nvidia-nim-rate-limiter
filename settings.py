@@ -1,6 +1,8 @@
 import argparse
 import ipaddress
+import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse, urlunparse
@@ -825,3 +827,160 @@ def validate_bind_guardrails(settings: AppSettings) -> Optional[str]:
     if settings.strict_trial_guardrails:
         raise ConfigError(msg)
     return msg
+
+
+def build_settings_source_metadata(resolved: AppSettings) -> Dict[str, Dict[str, Any]]:
+    """Build per-'section.key' precedence & lock metadata for the Settings UI."""
+    meta: Dict[str, Dict[str, Any]] = {}
+
+    for spec in PARAM_SPECS:
+        if not (spec.yaml_section and spec.yaml_key):
+            continue
+        path_key = f"{spec.yaml_section}.{spec.yaml_key}"
+        raw_src = resolved.sources.get(spec.name, "default")
+        locked = raw_src in ("argparse", "env", "dotenv")
+        detail: Optional[str] = None
+        if raw_src == "argparse":
+            detail = f"Set via CLI flag {spec.cli_flag}"
+        elif raw_src == "env":
+            detail = f"Set via environment variable {spec.env_var}"
+        elif raw_src == "dotenv":
+            detail = f"Set via .env file ({spec.env_var})"
+
+        meta[path_key] = {
+            "source": raw_src,
+            "locked": locked,
+            "cli_flag": spec.cli_flag,
+            "env_var": spec.env_var,
+            "detail": detail,
+        }
+
+    # YAML-only structured/optional keys
+    for path_key, src_name in (
+        ("rate_limit.models", "model_rate_limits"),
+        ("proxy.allowed_models", "allowed_models"),
+        ("proxy.blocked_models", "blocked_models"),
+        ("proxy.model_routes", "model_routes"),
+    ):
+        meta[path_key] = {
+            "source": resolved.sources.get(src_name, "default"),
+            "locked": False,
+            "cli_flag": None,
+            "env_var": None,
+            "detail": None,
+        }
+
+    db_url_src = resolved.sources.get("db_url", "default")
+    db_url_locked = db_url_src in ("argparse", "env", "dotenv")
+    db_url_detail: Optional[str] = None
+    if db_url_src == "argparse":
+        db_url_detail = "Overridden via CLI flag --db-url"
+    elif db_url_src == "env":
+        db_url_detail = "Overridden via environment variable DB_URL"
+    elif db_url_src == "dotenv":
+        db_url_detail = "Overridden via .env file (DB_URL)"
+
+    meta["db.url_env"] = {
+        "source": db_url_src if db_url_locked else ("config.yaml" if resolved.db_url_env else "default"),
+        "locked": db_url_locked,
+        "cli_flag": "--db-url" if db_url_locked else None,
+        "env_var": "DB_URL" if db_url_locked else None,
+        "detail": db_url_detail,
+    }
+
+    return meta
+
+
+def _is_empty_optional(val: Any) -> bool:
+    return val is None or (isinstance(val, str) and not val.strip())
+
+
+def normalize_admin_config_patch(new_config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalize optional/empty UI inputs before validation and config.yaml persistence."""
+    normalized: Dict[str, Any] = {}
+
+    if isinstance(new_config.get("admin"), Mapping):
+        admin_out: Dict[str, Any] = {}
+        for k, v in new_config["admin"].items():
+            if k == "title" and _is_empty_optional(v):
+                admin_out[k] = "NVIDIA NIM Rate Limiter Dashboard"
+            elif isinstance(v, str):
+                admin_out[k] = v.strip()
+            else:
+                admin_out[k] = v
+        normalized["admin"] = admin_out
+
+    if isinstance(new_config.get("rate_limit"), Mapping):
+        rl_out: Dict[str, Any] = {}
+        for k, v in new_config["rate_limit"].items():
+            if k in ("tokens_per_minute", "daily_request_cap", "daily_token_cap"):
+                rl_out[k] = 0 if _is_empty_optional(v) else _parse_non_negative_int(v)
+            elif k == "max_wait_seconds":
+                rl_out[k] = 0.0 if _is_empty_optional(v) else _parse_non_negative_float(v)
+            elif k == "models":
+                if _is_empty_optional(v):
+                    rl_out[k] = {}
+                elif isinstance(v, str):
+                    rl_out[k] = json.loads(v)
+                else:
+                    rl_out[k] = v
+            elif k in ("requests_per_minute", "window_seconds", "burst_capacity"):
+                rl_out[k] = _parse_positive_float(v)
+            else:
+                rl_out[k] = v
+        normalized["rate_limit"] = rl_out
+
+    if isinstance(new_config.get("proxy"), Mapping):
+        proxy_out: Dict[str, Any] = {}
+        for k, v in new_config["proxy"].items():
+            if k == "catalog_cache_ttl":
+                proxy_out[k] = 300.0 if _is_empty_optional(v) else _parse_non_negative_float(v)
+            elif k in ("allowed_models", "blocked_models"):
+                if _is_empty_optional(v):
+                    proxy_out[k] = []
+                elif isinstance(v, str):
+                    stripped = v.strip()
+                    if stripped.startswith("["):
+                        proxy_out[k] = json.loads(stripped)
+                    else:
+                        proxy_out[k] = [
+                            item.strip()
+                            for item in re.split(r"[\r\n,]+", stripped)
+                            if item.strip()
+                        ]
+                else:
+                    proxy_out[k] = v
+            elif k == "model_routes":
+                if _is_empty_optional(v):
+                    proxy_out[k] = {}
+                elif isinstance(v, str):
+                    proxy_out[k] = json.loads(v)
+                else:
+                    proxy_out[k] = v
+            elif k == "concurrency_limit":
+                proxy_out[k] = _parse_positive_int(v)
+            elif k == "upstream_url":
+                proxy_out[k] = _parse_non_empty_str(v)
+            elif k == "enforce_catalog":
+                proxy_out[k] = _parse_bool(v)
+            else:
+                proxy_out[k] = v
+        normalized["proxy"] = proxy_out
+
+    if isinstance(new_config.get("db"), Mapping):
+        db_out: Dict[str, Any] = {}
+        for k, v in new_config["db"].items():
+            if k == "url_env":
+                db_out[k] = None if _is_empty_optional(v) else str(v).strip()
+            elif k in ("pool_min", "pool_max"):
+                default_pool = 1 if k == "pool_min" else 5
+                db_out[k] = default_pool if _is_empty_optional(v) else _parse_positive_int(v)
+            elif k == "connect_timeout":
+                db_out[k] = 10.0 if _is_empty_optional(v) else _parse_positive_float(v)
+            elif k == "path":
+                db_out[k] = _parse_non_empty_str(v)
+            else:
+                db_out[k] = v
+        normalized["db"] = db_out
+
+    return normalized

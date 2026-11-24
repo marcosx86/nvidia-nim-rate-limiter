@@ -50,6 +50,37 @@
             font-size: 0.8rem;
             border: 1px solid rgba(118, 185, 0, 0.4);
         }
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .nav-links {
+            display: inline-flex;
+            gap: 6px;
+            background: rgba(0, 0, 0, 0.25);
+            padding: 4px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+        }
+        .nav-link {
+            color: var(--text-muted);
+            text-decoration: none;
+            font-size: 0.84rem;
+            font-weight: 500;
+            padding: 5px 12px;
+            border-radius: 6px;
+            transition: all 0.15s ease;
+        }
+        .nav-link:hover {
+            color: #fff;
+            background: rgba(255, 255, 255, 0.06);
+        }
+        .nav-link.active {
+            background: rgba(118, 185, 0, 0.18);
+            color: var(--accent);
+            font-weight: 600;
+        }
         .trial-banner {
             display: none;
             align-items: center;
@@ -311,7 +342,13 @@
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
             <span id="headerTitle">{{ ADMIN_TITLE }}</span>
         </h1>
-        <span class="badge" id="statusBadge">Active</span>
+        <div class="header-actions">
+            <nav class="nav-links" aria-label="Admin Navigation">
+                <a class="nav-link active" href="/admin/">Dashboard</a>
+                <a class="nav-link" href="/admin/settings">Settings</a>
+            </nav>
+            <span class="badge" id="statusBadge">Active</span>
+        </div>
     </div>
 
     <div class="trial-banner" id="trialBanner">
@@ -347,75 +384,42 @@
         </div>
     </div>
 
-    <div class="flex-container">
-        <div class="section">
-            <div class="section-title section-header-wrap">
-                <span>Recent Request Logs</span>
-                <div class="controls-group">
-                    <div class="filter-bar" id="filterBar">
-                        <button class="filter-pill" id="filter-get" onclick="toggleFilter('method', 'GET')">GET</button>
-                        <button class="filter-pill" id="filter-post" onclick="toggleFilter('method', 'POST')">POST</button>
-                        <span class="filter-sep"></span>
-                        <button class="filter-pill" id="filter-success" onclick="toggleFilter('status', 'success')">Success (2xx/3xx)</button>
-                        <button class="filter-pill" id="filter-errors" onclick="toggleFilter('status', 'error')">Errors (4xx/5xx)</button>
-                        <span id="modelFiltersContainer" style="display: contents;"></span>
-                        <button id="btnClearFilters" class="btn-clear-filters" style="display: none;" onclick="clearAllFilters()">Reset</button>
-                    </div>
-                    <button class="btn btn-refresh" onclick="fetchMetricsAndLogs()">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
-                        Refresh
-                    </button>
+    <div class="section">
+        <div class="section-title section-header-wrap">
+            <span>Recent Request Logs</span>
+            <div class="controls-group">
+                <div class="filter-bar" id="filterBar">
+                    <button class="filter-pill" id="filter-get" onclick="toggleFilter('method', 'GET')">GET</button>
+                    <button class="filter-pill" id="filter-post" onclick="toggleFilter('method', 'POST')">POST</button>
+                    <span class="filter-sep"></span>
+                    <button class="filter-pill" id="filter-success" onclick="toggleFilter('status', 'success')">Success (2xx/3xx)</button>
+                    <button class="filter-pill" id="filter-errors" onclick="toggleFilter('status', 'error')">Errors (4xx/5xx)</button>
+                    <span id="modelFiltersContainer" style="display: contents;"></span>
+                    <button id="btnClearFilters" class="btn-clear-filters" style="display: none;" onclick="clearAllFilters()">Reset</button>
                 </div>
-            </div>
-            <div class="table-responsive">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Time</th>
-                            <th>Method</th>
-                            <th>Path</th>
-                            <th>Model</th>
-                            <th>Tokens (In / Out)</th>
-                            <th>Status</th>
-                            <th>Latency</th>
-                        </tr>
-                    </thead>
-                    <tbody id="logsBody">
-                        <tr><td colspan="7">Loading request logs...</td></tr>
-                    </tbody>
-                </table>
+                <button class="btn btn-refresh" onclick="fetchMetricsAndLogs()">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
+                    Refresh
+                </button>
             </div>
         </div>
-
-        <div class="section">
-            <div class="section-title">Configuration</div>
-            <form id="configForm" onsubmit="saveConfig(event)">
-                <div class="form-group">
-                    <label>Dashboard Title</label>
-                    <input type="text" id="cfgTitle" required>
-                </div>
-                <div class="form-group">
-                    <label>Requests Per Minute (RPM)</label>
-                    <input type="number" step="0.1" id="cfgRpm" required>
-                </div>
-                <div class="form-group">
-                    <label>Window Seconds</label>
-                    <input type="number" step="0.1" id="cfgWindow" required>
-                </div>
-                <div class="form-group">
-                    <label>Burst Capacity</label>
-                    <input type="number" step="0.1" id="cfgBurst" required>
-                </div>
-                <div class="form-group">
-                    <label>Concurrency Limit</label>
-                    <input type="number" id="cfgConcurrency" required>
-                </div>
-                <div class="form-group">
-                    <label>Upstream URL</label>
-                    <input type="text" id="cfgUpstream" required>
-                </div>
-                <button type="submit" class="btn" style="width: 100%;">Save & Apply Settings</button>
-            </form>
+        <div class="table-responsive">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Method</th>
+                        <th>Path</th>
+                        <th>Model</th>
+                        <th>Tokens (In / Out)</th>
+                        <th>Status</th>
+                        <th>Latency</th>
+                    </tr>
+                </thead>
+                <tbody id="logsBody">
+                    <tr><td colspan="7">Loading request logs...</td></tr>
+                </tbody>
+            </table>
         </div>
     </div>
 
@@ -601,7 +605,7 @@
             });
         }
 
-        async function loadConfigForm() {
+        async function loadHeaderAndConfigMeta() {
             try {
                 const configRes = await fetch('/admin/config');
                 const config = await configRes.json();
@@ -609,13 +613,6 @@
                 const title = config.admin?.title || 'NVIDIA NIM Rate Limiter Dashboard';
                 document.title = title;
                 document.getElementById('headerTitle').innerText = title;
-                document.getElementById('cfgTitle').value = title;
-
-                document.getElementById('cfgRpm').value = config.rate_limit?.requests_per_minute ?? 6;
-                document.getElementById('cfgWindow').value = config.rate_limit?.window_seconds ?? 60;
-                document.getElementById('cfgBurst').value = config.rate_limit?.burst_capacity ?? 6;
-                document.getElementById('cfgConcurrency').value = config.proxy?.concurrency_limit ?? 1;
-                document.getElementById('cfgUpstream').value = config.proxy?.upstream_url ?? '';
                 document.getElementById('valMaxConcurrency').innerText = 'Max Allowed: ' + (config.proxy?.concurrency_limit ?? '-');
             } catch (err) {
                 console.error('Error loading config:', err);
@@ -663,43 +660,8 @@
             }
         }
 
-        async function saveConfig(e) {
-            e.preventDefault();
-            const payload = {
-                admin: {
-                    title: document.getElementById('cfgTitle').value
-                },
-                rate_limit: {
-                    requests_per_minute: parseFloat(document.getElementById('cfgRpm').value),
-                    window_seconds: parseFloat(document.getElementById('cfgWindow').value),
-                    burst_capacity: parseFloat(document.getElementById('cfgBurst').value)
-                },
-                proxy: {
-                    concurrency_limit: parseInt(document.getElementById('cfgConcurrency').value, 10),
-                    upstream_url: document.getElementById('cfgUpstream').value
-                }
-            };
-            try {
-                const res = await fetch('/admin/config', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                if (res.ok) {
-                    alert('Configuration updated successfully!');
-                    await loadConfigForm();
-                    await fetchMetricsAndLogs();
-                } else {
-                    alert('Error updating configuration.');
-                }
-            } catch (err) {
-                console.error('Error saving config:', err);
-                alert('Failed to connect to server.');
-            }
-        }
-
         // Initialize
-        loadConfigForm();
+        loadHeaderAndConfigMeta();
         fetchMetricsAndLogs();
         setInterval(fetchMetricsAndLogs, 5000);
     </script>

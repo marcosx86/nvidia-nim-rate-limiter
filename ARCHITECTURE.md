@@ -10,7 +10,8 @@ This repository is an asynchronous FastAPI reverse proxy, token-bucket rate limi
 - **`settings.py`**: Declarative parameter specs, `argparse` CLI parser, bind guardrails, and strict configuration precedence resolver (`argparse > environment var > dotenv > config.yaml > default or fail if required`).
 - **`database.py`**: Async repository layer (`DatabaseBackend`) supporting `SQLiteBackend` (`aiosqlite`) and `PostgresBackend` (`asyncpg`) for `request_logs`, aggregated metrics, log filtering, daily quota usage, and retention pruning.
 - **`migrations.py`**: Dialect-agnostic, transactional, SHA-256-verified schema migration runner (`schema_migrations`) supporting SQLite legacy adoption and PostgreSQL advisory-lock execution.
-- **`wwwroot/index.html`**: Static dark-mode Web Admin Dashboard served at `/admin/` with dynamic `admin.title` injection and interactive config/metrics/log filtering.
+- **`wwwroot/index.html`**: Static dark-mode Web Admin Dashboard served at `/admin/` with dynamic `admin.title` injection, trial-mode banner, and interactive metrics/log filtering.
+- **`wwwroot/settings.html`**: Separated precedence-aware Configuration UI served at `/admin/settings` covering all `config.yaml` sections, optional empty values, and locked field warnings for higher-precedence overrides.
 - **`config.yaml`**: Persisted runtime configuration (`proxy`, `rate_limit`, `db`, `admin`).
 - **`tests/test_app.py`**: `pytest` + `pytest-asyncio` test suite.
 - **`Dockerfile` & `docker-compose.yml`**: Containerized deployment (default port `8199:8000`, persistent `data/` volume).

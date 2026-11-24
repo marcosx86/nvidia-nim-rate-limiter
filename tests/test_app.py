@@ -735,7 +735,6 @@ def test_proxy_max_wait_seconds_fast_fail_and_logs(monkeypatch):
 def test_proxy_daily_request_and_token_caps(monkeypatch):
     monkeypatch.setenv("RPM", "60")
     monkeypatch.setenv("BURST_CAPACITY", "10")
-    monkeypatch.setenv("DAILY_REQUEST_CAP", "1")
 
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -749,6 +748,8 @@ def test_proxy_daily_request_and_token_caps(monkeypatch):
             base_url="https://mock.nvidia.test",
             transport=transport,
         )
+        # Set daily_request_cap via /admin/config (unlocked) so it can be raised later in the test
+        client.post("/admin/config", json={"rate_limit": {"daily_request_cap": 1}})
         r1 = client.post("/v1/chat/completions", json={"model": "meta/llama-3.1-8b-instruct"})
         assert r1.status_code == 200
 
@@ -1335,3 +1336,157 @@ def test_cli_migrate_only_and_migration_status(monkeypatch, tmp_path, capsys):
     assert after_out["backend"] == "sqlite"
     assert after_out["current_version"] == 3
     assert after_out["pending"] == []
+
+
+# --- Spec 06: Separated Settings UI & Precedence Awareness ---
+def test_settings_ui_separated_from_dashboard():
+    with TestClient(app) as client:
+        dash = client.get("/admin/")
+        assert dash.status_code == 200
+        assert 'href="/admin/settings"' in dash.text
+        assert 'id="configForm"' not in dash.text
+
+        settings_page = client.get("/admin/settings")
+        assert settings_page.status_code == 200
+        assert 'id="settingsForm"' in settings_page.text
+        assert 'href="/admin/"' in settings_page.text
+        assert "Rate Limiting" in settings_page.text
+        assert "Database Storage" in settings_page.text
+        assert "/admin/settings/state" in settings_page.text
+
+        # Dynamic title propagates to /admin/settings as well
+        resp_post = client.post("/admin/config", json={"admin": {"title": "Separated Settings Title"}})
+        assert resp_post.status_code == 200
+        settings_updated = client.get("/admin/settings")
+        assert "<title>Separated Settings Title — Settings</title>" in settings_updated.text
+
+
+def test_settings_state_precedence_locking_and_server_enforcement(monkeypatch, tmp_path):
+    dotenv_file = tmp_path / "locked.env"
+    dotenv_file.write_text("WINDOW_SECONDS=45\n", encoding="utf-8")
+    cfg_file = tmp_path / "locked.yaml"
+
+    monkeypatch.setenv("ENV_FILE", str(dotenv_file))
+    monkeypatch.setenv("CONFIG_FILE", str(cfg_file))
+    monkeypatch.setenv("RPM", "22")
+
+    # Configure runtime as CLI with --burst-capacity 15 (argparse > env > dotenv > config.yaml)
+    app_module.configure_runtime(
+        argv=["--burst-capacity", "15"],
+        require_secrets=True,
+        from_cli=True,
+    )
+
+    with TestClient(app) as client:
+        state = client.get("/admin/settings/state").json()
+        sources = state["sources"]
+
+        assert sources["rate_limit.burst_capacity"]["source"] == "argparse"
+        assert sources["rate_limit.burst_capacity"]["locked"] is True
+        assert "--burst-capacity" in sources["rate_limit.burst_capacity"]["detail"]
+
+        assert sources["rate_limit.requests_per_minute"]["source"] == "env"
+        assert sources["rate_limit.requests_per_minute"]["locked"] is True
+        assert "RPM" in sources["rate_limit.requests_per_minute"]["detail"]
+
+        assert sources["rate_limit.window_seconds"]["source"] == "dotenv"
+        assert sources["rate_limit.window_seconds"]["locked"] is True
+        assert ".env" in sources["rate_limit.window_seconds"]["detail"]
+
+        # Unlocked fields remain editable
+        assert sources["admin.title"]["locked"] is False
+        assert sources["proxy.concurrency_limit"]["locked"] is False
+
+        # Runtime info never leaks raw API key
+        assert state["runtime_info"]["nvidia_api_key_source"] == "env"
+        assert "nvapi-test-default-key" not in json.dumps(state)
+
+        # Attempt to overwrite both locked and unlocked fields via POST /admin/config
+        resp = client.post(
+            "/admin/config",
+            json={
+                "admin": {"title": "Updated Unlocked Title"},
+                "rate_limit": {
+                    "requests_per_minute": 999.0,
+                    "window_seconds": 999.0,
+                    "burst_capacity": 999.0,
+                },
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert set(body["ignored_locked_fields"]) == {
+            "rate_limit.requests_per_minute",
+            "rate_limit.window_seconds",
+            "rate_limit.burst_capacity",
+        }
+        assert body["config"]["admin"]["title"] == "Updated Unlocked Title"
+        assert body["config"]["rate_limit"]["requests_per_minute"] == 22.0
+        assert body["config"]["rate_limit"]["window_seconds"] == 45.0
+        assert body["config"]["rate_limit"]["burst_capacity"] == 15.0
+
+
+def test_settings_optional_empty_fields_normalization():
+    with TestClient(app) as client:
+        # First set non-empty optional values
+        r_set = client.post(
+            "/admin/config",
+            json={
+                "rate_limit": {
+                    "tokens_per_minute": 5000,
+                    "max_wait_seconds": 2.5,
+                    "daily_request_cap": 100,
+                    "daily_token_cap": 50000,
+                    "models": {"deepseek-ai/deepseek-r1": {"requests_per_minute": 5}},
+                },
+                "proxy": {
+                    "allowed_models": "meta/llama-3.3-70b-instruct\ndeepseek-ai/deepseek-r1",
+                    "blocked_models": "bad/model",
+                    "model_routes": {
+                        "meta/llama-3.3-70b-instruct": {"upstream_url": "http://nim-local:8000"}
+                    },
+                },
+                "db": {"url_env": "CUSTOM_PG_DSN"},
+            },
+        )
+        assert r_set.status_code == 200
+        cfg1 = r_set.json()["config"]
+        assert cfg1["rate_limit"]["tokens_per_minute"] == 5000
+        assert cfg1["proxy"]["allowed_models"] == [
+            "meta/llama-3.3-70b-instruct",
+            "deepseek-ai/deepseek-r1",
+        ]
+        assert cfg1["db"]["url_env"] == "CUSTOM_PG_DSN"
+
+        # Now submit empty strings / null for all optional fields -> cleanly resets
+        r_clear = client.post(
+            "/admin/config",
+            json={
+                "rate_limit": {
+                    "tokens_per_minute": "",
+                    "max_wait_seconds": None,
+                    "daily_request_cap": "",
+                    "daily_token_cap": "",
+                    "models": "",
+                },
+                "proxy": {
+                    "allowed_models": "",
+                    "blocked_models": None,
+                    "model_routes": "",
+                    "catalog_cache_ttl": "",
+                },
+                "db": {"url_env": ""},
+            },
+        )
+        assert r_clear.status_code == 200
+        cfg2 = r_clear.json()["config"]
+        assert cfg2["rate_limit"]["tokens_per_minute"] == 0
+        assert cfg2["rate_limit"]["max_wait_seconds"] == 0.0
+        assert cfg2["rate_limit"]["daily_request_cap"] == 0
+        assert cfg2["rate_limit"]["daily_token_cap"] == 0
+        assert cfg2["rate_limit"]["models"] == {}
+        assert cfg2["proxy"]["allowed_models"] == []
+        assert cfg2["proxy"]["blocked_models"] == []
+        assert cfg2["proxy"]["model_routes"] == {}
+        assert cfg2["proxy"]["catalog_cache_ttl"] == 300.0
+        assert "url_env" not in cfg2["db"]
