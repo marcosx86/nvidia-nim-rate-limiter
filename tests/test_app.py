@@ -1490,3 +1490,24 @@ def test_settings_optional_empty_fields_normalization():
         assert cfg2["proxy"]["model_routes"] == {}
         assert cfg2["proxy"]["catalog_cache_ttl"] == 300.0
         assert "url_env" not in cfg2["db"]
+
+
+def test_skip_logging_root_and_favicon_get():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    with TestClient(app) as client:
+        app_module.http_client = httpx.AsyncClient(
+            base_url="https://mock.nvidia.test",
+            transport=httpx.MockTransport(handler),
+        )
+        assert client.get("/").status_code == 200
+        assert client.get("/favicon.ico").status_code == 200
+        assert client.get("/v1/models").status_code == 200
+        time.sleep(0.15)
+
+        logs = client.get("/admin/logs").json()["logs"]
+        logged_paths = [(entry["method"], entry["path"]) for entry in logs]
+        assert ("GET", "/") not in logged_paths
+        assert ("GET", "/favicon.ico") not in logged_paths
+        assert ("GET", "/v1/models") in logged_paths

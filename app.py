@@ -451,6 +451,12 @@ async def admin_settings_page():
     )
 
 
+def should_log_request(method: str, path: str) -> bool:
+    """Return False for noisy browser root/favicon GET probes."""
+    normalized_path = "/" + path.lstrip("/")
+    return not (method.upper() == "GET" and normalized_path in ("/", "/favicon.ico"))
+
+
 # --- Main Proxy Middleware & Handler ---
 @app.api_route(
     "/{path:path}",
@@ -462,6 +468,7 @@ async def proxy_request(path: str, request: Request):
         raise HTTPException(status_code=404, detail="Not Found")
 
     start_time = time.time()
+    log_enabled = should_log_request(request.method, path)
 
     try:
         body = await request.body()
@@ -483,16 +490,17 @@ async def proxy_request(path: str, request: Request):
     policy_reason = model_router.check_model_policy(model_name)
     if policy_reason is not None:
         latency_ms = (time.time() - start_time) * 1000.0
-        await db_backend.log_request(
-            method=request.method,
-            path="/" + path,
-            status_code=403,
-            latency_ms=latency_ms,
-            request_bytes=len(body),
-            response_bytes=0,
-            allowed=False,
-            model=model_name,
-        )
+        if log_enabled:
+            await db_backend.log_request(
+                method=request.method,
+                path="/" + path,
+                status_code=403,
+                latency_ms=latency_ms,
+                request_bytes=len(body),
+                response_bytes=0,
+                allowed=False,
+                model=model_name,
+            )
         return JSONResponse(
             status_code=403,
             content={
@@ -504,16 +512,17 @@ async def proxy_request(path: str, request: Request):
 
     if config_data.get("proxy", {}).get("enforce_catalog") and catalog_cache.is_known(model_name) is False:
         latency_ms = (time.time() - start_time) * 1000.0
-        await db_backend.log_request(
-            method=request.method,
-            path="/" + path,
-            status_code=404,
-            latency_ms=latency_ms,
-            request_bytes=len(body),
-            response_bytes=0,
-            allowed=False,
-            model=model_name,
-        )
+        if log_enabled:
+            await db_backend.log_request(
+                method=request.method,
+                path="/" + path,
+                status_code=404,
+                latency_ms=latency_ms,
+                request_bytes=len(body),
+                response_bytes=0,
+                allowed=False,
+                model=model_name,
+            )
         return JSONResponse(
             status_code=404,
             content={
@@ -548,16 +557,17 @@ async def proxy_request(path: str, request: Request):
             }
         if quota_payload is not None:
             latency_ms = (time.time() - start_time) * 1000.0
-            await db_backend.log_request(
-                method=request.method,
-                path="/" + path,
-                status_code=429,
-                latency_ms=latency_ms,
-                request_bytes=len(body),
-                response_bytes=0,
-                allowed=False,
-                model=model_name,
-            )
+            if log_enabled:
+                await db_backend.log_request(
+                    method=request.method,
+                    path="/" + path,
+                    status_code=429,
+                    latency_ms=latency_ms,
+                    request_bytes=len(body),
+                    response_bytes=0,
+                    allowed=False,
+                    model=model_name,
+                )
             return JSONResponse(
                 status_code=429,
                 content=quota_payload,
@@ -574,16 +584,17 @@ async def proxy_request(path: str, request: Request):
     except RateLimitExceeded as exc:
         latency_ms = (time.time() - start_time) * 1000.0
         retry_sec = int(max(1, math.ceil(exc.retry_after)))
-        await db_backend.log_request(
-            method=request.method,
-            path="/" + path,
-            status_code=429,
-            latency_ms=latency_ms,
-            request_bytes=len(body),
-            response_bytes=0,
-            allowed=False,
-            model=model_name,
-        )
+        if log_enabled:
+            await db_backend.log_request(
+                method=request.method,
+                path="/" + path,
+                status_code=429,
+                latency_ms=latency_ms,
+                request_bytes=len(body),
+                response_bytes=0,
+                allowed=False,
+                model=model_name,
+            )
         return JSONResponse(
             status_code=429,
             content=exc.detail,
@@ -674,21 +685,22 @@ async def proxy_request(path: str, request: Request):
                     prompt_tokens, completion_tokens, total_tokens = extract_tokens(response_text)
                     reconcile_val = total_tokens if upstream_response.status_code < 400 else None
                     await rate_limit_manager.reconcile_tokens(reservation, reconcile_val)
-                    asyncio.create_task(
-                        db_backend.log_request(
-                            method=request.method,
-                            path="/" + path,
-                            status_code=upstream_response.status_code,
-                            latency_ms=latency_ms,
-                            request_bytes=len(body),
-                            response_bytes=bytes_count,
-                            allowed=True,
-                            model=model_name,
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=completion_tokens,
-                            total_tokens=total_tokens,
+                    if log_enabled:
+                        asyncio.create_task(
+                            db_backend.log_request(
+                                method=request.method,
+                                path="/" + path,
+                                status_code=upstream_response.status_code,
+                                latency_ms=latency_ms,
+                                request_bytes=len(body),
+                                response_bytes=bytes_count,
+                                allowed=True,
+                                model=model_name,
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                total_tokens=total_tokens,
+                            )
                         )
-                    )
 
             return StreamingResponse(
                 stream_generator(),
@@ -703,18 +715,19 @@ async def proxy_request(path: str, request: Request):
         except Exception as e:
             await rate_limit_manager.reconcile_tokens(reservation, None)
             latency_ms = (time.time() - start_time) * 1000.0
-            asyncio.create_task(
-                db_backend.log_request(
-                    method=request.method,
-                    path="/" + path,
-                    status_code=502,
-                    latency_ms=latency_ms,
-                    request_bytes=len(body),
-                    response_bytes=0,
-                    allowed=True,
-                    model=model_name,
+            if log_enabled:
+                asyncio.create_task(
+                    db_backend.log_request(
+                        method=request.method,
+                        path="/" + path,
+                        status_code=502,
+                        latency_ms=latency_ms,
+                        request_bytes=len(body),
+                        response_bytes=0,
+                        allowed=True,
+                        model=model_name,
+                    )
                 )
-            )
             return JSONResponse(
                 status_code=502,
                 content={"error": "Bad Gateway", "details": str(e)},
